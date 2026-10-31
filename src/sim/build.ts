@@ -18,6 +18,12 @@ export class ModelBuilder {
     return id;
   }
 
+  /** Mirrors a block so its input is on the right (feedback paths). */
+  flip(id: string): this {
+    this.model.blocks.find((b) => b.id === id)!.flip = true;
+    return this;
+  }
+
   connect(src: string, srcPort: number, dst: string, dstPort: number): this {
     this.model.links.push({ id: `l${++this.n}`, src: { block: src, port: srcPort }, dst: { block: dst, port: dstPort } });
     return this;

@@ -1,10 +1,10 @@
 // Modal dialogs: block parameters, simulation settings and workspace variables.
 
 import { useState, type ReactNode } from 'react';
-import { BLOCKS, type Params } from '../sim/blocks';
-import { evaluate, runWorkspace } from '../sim/expr';
+import { BLOCKS, type ParamDef, type Params } from '../sim/blocks';
+import { evaluate, runWorkspace, type Scope } from '../sim/expr';
 import { SOLVER_LABELS } from '../sim/solvers';
-import { FIXED_STEP_SOLVERS, type BlockModel, type SimSettings, type SolverName } from '../sim/types';
+import { FIXED_STEP_SOLVERS, type BlockModel, type MaskDef, type MaskParam, type SimSettings, type SolverName } from '../sim/types';
 
 export function Modal({ title, children, onClose, footer }: { title: string; children: ReactNode; onClose(): void; footer: ReactNode }) {
   return (
@@ -24,25 +24,35 @@ export function Modal({ title, children, onClose, footer }: { title: string; chi
   );
 }
 
-export function ParamDialog({ block, workspace, onApply, onClose }: {
+export function ParamDialog({ block, scope, scopeError, onApply, onClose, onOpenContents, onEditMask }: {
   block: BlockModel;
-  workspace: string;
+  /** Variables visible at the block's level (workspace and enclosing masks). */
+  scope: Scope;
+  scopeError?: string;
   onApply(b: BlockModel): void;
   onClose(): void;
+  onOpenContents?(): void;
+  onEditMask?(): void;
 }) {
+  const masked = block.type === 'Subsystem' && block.mask;
   const def = BLOCKS[block.type];
+  const paramDefs: ParamDef[] = masked
+    ? block.mask!.params.map((mp) => ({ name: mp.name, label: mp.label || mp.name, default: mp.default }))
+    : def.params;
+  const title = masked ? block.mask!.title || block.name : def.label;
+  const description = masked ? block.mask!.description : def.description;
   const [name, setName] = useState(block.name);
   const [values, setValues] = useState<Record<string, string>>(() =>
-    Object.fromEntries(def.params.map((p) => [p.name, block.params[p.name] ?? p.default])),
+    Object.fromEntries(paramDefs.map((p) => [p.name, block.params[p.name] ?? p.default])),
   );
   const [error, setError] = useState('');
 
   const apply = () => {
     if (!name.trim()) return setError('Názov bloku nesmie byť prázdny.');
     try {
-      const scope = runWorkspace(workspace);
+      if (scopeError) throw new Error(scopeError);
       const params: Params = {};
-      for (const pd of def.params) {
+      for (const pd of paramDefs) {
         const raw = values[pd.name];
         if (pd.kind === 'text' || pd.kind === 'choice') params[pd.name] = raw;
         else {
@@ -53,29 +63,32 @@ export function ParamDialog({ block, workspace, onApply, onClose }: {
           }
         }
       }
-      def.create(params);
+      if (!masked) def.create(params);
     } catch (e) {
       return setError((e as Error).message);
     }
-    onApply({ ...block, name: name.trim(), params: values });
+    onApply({ ...block, name: name.trim(), params: { ...block.params, ...values } });
   };
 
   return (
     <Modal
-      title={`Parametre bloku: ${def.label}`}
+      title={`Parametre bloku: ${title}`}
       onClose={onClose}
       footer={<>
+        {onEditMask && <button onClick={onEditMask}>Upraviť masku</button>}
+        {onOpenContents && <button onClick={onOpenContents}>Otvoriť obsah</button>}
+        <span className="spacer" />
         <button onClick={onClose}>Zrušiť</button>
         <button className="primary" onClick={apply}>OK</button>
       </>}
     >
-      <p className="hint">{def.description}</p>
+      {description && <p className="hint">{description}</p>}
       <form onSubmit={(e) => { e.preventDefault(); apply(); }}>
         <label>
           Názov
           <input value={name} onChange={(e) => setName(e.target.value)} autoFocus />
         </label>
-        {def.params.map((pd) => (
+        {paramDefs.map((pd) => (
           <label key={pd.name}>
             {pd.label}
             {pd.kind === 'choice' ? (
@@ -93,9 +106,76 @@ export function ParamDialog({ block, workspace, onApply, onClose }: {
         ))}
         <button type="submit" hidden />
       </form>
-      {def.params.some((pd) => !pd.kind || pd.kind === 'expr') && (
+      {paramDefs.some((pd) => !pd.kind || pd.kind === 'expr') && (
         <p className="hint">Hodnoty môžu byť výrazy, napr. <code>2*pi*f</code> alebo <code>[1 2 1]</code>, s premennými z pracovného priestoru.</p>
       )}
+      {error && <p className="error-text">{error}</p>}
+    </Modal>
+  );
+}
+
+const IDENT = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+/** Defines a subsystem's mask: its title, help text and parameters. */
+export function MaskDialog({ block, onApply, onClose }: {
+  block: BlockModel;
+  onApply(mask: MaskDef | undefined): void;
+  onClose(): void;
+}) {
+  const [title, setTitle] = useState(block.mask?.title ?? block.name);
+  const [description, setDescription] = useState(block.mask?.description ?? '');
+  const [params, setParams] = useState<MaskParam[]>(block.mask?.params ?? [{ name: 'K', label: 'Zosilnenie', default: '1' }]);
+  const [error, setError] = useState('');
+
+  const setRow = (i: number, patch: Partial<MaskParam>) => setParams(params.map((p, j) => (j === i ? { ...p, ...patch } : p)));
+  const apply = () => {
+    const names = params.map((p) => p.name.trim());
+    const bad = names.find((n) => !IDENT.test(n));
+    if (bad !== undefined) return setError(`„${bad}“ nie je platný názov premennej.`);
+    if (new Set(names).size !== names.length) return setError('Názvy parametrov sa nesmú opakovať.');
+    for (const p of params) {
+      try {
+        evaluate(p.default);
+      } catch (e) {
+        return setError(`Predvolená hodnota „${p.name}“: ${(e as Error).message}`);
+      }
+    }
+    onApply({ title: title.trim(), description: description.trim(), params: params.map((p) => ({ ...p, name: p.name.trim() })) });
+  };
+
+  return (
+    <Modal
+      title={`Maska subsystému: ${block.name}`}
+      onClose={onClose}
+      footer={<>
+        {block.mask && <button onClick={() => onApply(undefined)}>Odstrániť masku</button>}
+        <span className="spacer" />
+        <button onClick={onClose}>Zrušiť</button>
+        <button className="primary" onClick={apply}>OK</button>
+      </>}
+    >
+      <p className="hint">
+        Maska dá subsystému vlastný dialóg parametrov. Každý parameter je premenná, ktorú môžu použiť bloky vo vnútri.
+      </p>
+      <form onSubmit={(e) => { e.preventDefault(); apply(); }}>
+        <label>Nadpis <input value={title} onChange={(e) => setTitle(e.target.value)} /></label>
+        <label>Popis <textarea rows={2} value={description} onChange={(e) => setDescription(e.target.value)} /></label>
+        <table className="mask-table">
+          <thead><tr><th>Premenná</th><th>Popis v dialógu</th><th>Predvolená hodnota</th><th /></tr></thead>
+          <tbody>
+            {params.map((p, i) => (
+              <tr key={i}>
+                <td><input value={p.name} spellCheck={false} onChange={(e) => setRow(i, { name: e.target.value })} /></td>
+                <td><input value={p.label} onChange={(e) => setRow(i, { label: e.target.value })} /></td>
+                <td><input value={p.default} spellCheck={false} onChange={(e) => setRow(i, { default: e.target.value })} /></td>
+                <td><button type="button" title="Odstrániť" onClick={() => setParams(params.filter((_, j) => j !== i))}>✕</button></td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        <button type="button" onClick={() => setParams([...params, { name: '', label: '', default: '0' }])}>+ Pridať parameter</button>
+        <button type="submit" hidden />
+      </form>
       {error && <p className="error-text">{error}</p>}
     </Modal>
   );

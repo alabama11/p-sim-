@@ -1,21 +1,25 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { BLOCKS } from '../sim/blocks';
 import { runWorkspace, type Scope } from '../sim/expr';
+import { scopeAt } from '../sim/flatten';
 import { simulate, SimError, type SimResult } from '../sim/engine';
 import { SOLVER_LABELS } from '../sim/solvers';
-import { defaultSettings, emptyModel, type Model, type SolverName } from '../sim/types';
+import { defaultSettings, emptyModel, type BlockModel, type Diagram, type Model, type SolverName } from '../sim/types';
 import { Canvas, type View } from './Canvas';
-import { ParamDialog, SettingsDialog, WorkspaceDialog } from './dialogs';
+import { MaskDialog, ParamDialog, SettingsDialog, WorkspaceDialog } from './dialogs';
 import { EXAMPLES } from './examples';
 import { blockSize } from './geometry';
 import { Library } from './Library';
-import { addBlock, copySelection, deleteSelection, paste, pruneLinks, type Clip } from './modelOps';
+import {
+  addBlock, copySelection, createSubsystem, deleteSelection, findByPath, getDiagram, paste, pathNames, pruneLinks,
+  setDiagram, validPath, type Clip,
+} from './modelOps';
 import { ScopeWindow } from './ScopeWindow';
 
 const APP_NAME = 'P-Sim';
 const AUTOSAVE_KEY = 'psim:autosave';
 
-type Dialog = { kind: 'params'; id: string } | { kind: 'settings' } | { kind: 'workspace' } | { kind: 'help' } | null;
+type Dialog = { kind: 'params'; id: string } | { kind: 'mask'; id: string } | { kind: 'settings' } | { kind: 'workspace' } | { kind: 'help' } | null;
 
 interface History {
   past: Model[];
@@ -37,7 +41,13 @@ function parseModelFile(text: string): Model {
   const data = JSON.parse(text);
   const m = data?.format === 'p-sim' ? data.model : data;
   if (!m || !Array.isArray(m.blocks) || !Array.isArray(m.links)) throw new Error('Súbor neobsahuje model P-Sim.');
-  for (const b of m.blocks) if (!BLOCKS[b.type]) throw new Error(`Neznámy typ bloku „${b.type}“.`);
+  const check = (d: Diagram) => {
+    for (const b of d.blocks) {
+      if (!BLOCKS[b.type]) throw new Error(`Neznámy typ bloku „${b.type}“.`);
+      if (b.children) check(b.children);
+    }
+  };
+  check(m);
   return {
     ...emptyModel(),
     ...m,
@@ -49,6 +59,11 @@ function parseModelFile(text: string): Model {
 export function App() {
   const [hist, setHist] = useState<History>(() => ({ past: [], present: loadInitial(), future: [] }));
   const model = hist.present;
+  const [rawPath, setPath] = useState<string[]>([]);
+  // Undo can remove the subsystem being viewed; fall back to the deepest level that exists.
+  const path = validPath(model, rawPath);
+  const diagram = getDiagram(model, path);
+  const prefix = path.length ? path.join('/') + '/' : '';
   const [view, setView] = useState<View>({ x: 40, y: 40, k: 1 });
   const [selection, setSelection] = useState<Set<string>>(new Set());
   const [dialog, setDialog] = useState<Dialog>(null);
@@ -62,8 +77,11 @@ export function App() {
   const fileRef = useRef<HTMLInputElement>(null);
 
   const setModel = useCallback((m: Model, record = true) => {
-    setHist((h) => (record ? { past: [...h.past, h.present].slice(-200), present: m, future: [] } : { ...h, present: m }));
+    const pm = pruneLinks(m);
+    setHist((h) => (record ? { past: [...h.past, h.present].slice(-200), present: pm, future: [] } : { ...h, present: pm }));
   }, []);
+  /** Replaces the diagram currently shown (top level or inside a subsystem). */
+  const setLevel = (d: Diagram, record = true) => setModel(setDiagram(model, path, d), record);
   const checkpoint = useCallback(() => {
     setHist((h) => ({ past: [...h.past, h.present].slice(-200), present: h.present, future: [] }));
   }, []);
@@ -82,7 +100,7 @@ export function App() {
     document.title = `${model.name} – ${APP_NAME}`;
   }, [model.name]);
 
-  const fitView = useCallback((m: Model) => {
+  const fitView = useCallback((m: Diagram) => {
     const el = mainRef.current;
     if (!el || m.blocks.length === 0) return setView({ x: 40, y: 40, k: 1 });
     const xs = m.blocks.flatMap((b) => [b.x, b.x + blockSize(b).w]);
@@ -96,6 +114,7 @@ export function App() {
 
   const replaceModel = (m: Model) => {
     setHist({ past: [], present: m, future: [] });
+    setPath([]);
     setSelection(new Set());
     setOpenScopes([]);
     setResult(null);
@@ -111,7 +130,11 @@ export function App() {
       try {
         const r = simulate(model);
         setResult(r);
-        const scopes = model.blocks.filter((b) => b.type === 'Scope').map((b) => b.id);
+        // Open the scopes of the top level and of the level being viewed.
+        const scopes = [
+          ...model.blocks.filter((b) => b.type === 'Scope').map((b) => b.id),
+          ...(path.length ? diagram.blocks.filter((b) => b.type === 'Scope').map((b) => prefix + b.id) : []),
+        ];
         setOpenScopes((open) => (open.length ? open : scopes));
       } catch (e) {
         setResult(null);
@@ -128,8 +151,8 @@ export function App() {
   };
 
   const add = (type: string, at = viewCenter()) => {
-    const r = addBlock(model, type, Math.round((at.x - 30) / 5) * 5, Math.round((at.y - 22) / 5) * 5);
-    setModel(r.model);
+    const r = addBlock(diagram, type, Math.round((at.x - 30) / 5) * 5, Math.round((at.y - 22) / 5) * 5);
+    setLevel(r.diagram);
     setSelection(new Set([r.id]));
   };
 
@@ -140,7 +163,7 @@ export function App() {
       if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || dialog) return;
       const mod = e.ctrlKey || e.metaKey;
       if ((e.key === 'Delete' || e.key === 'Backspace') && selection.size) {
-        setModel(deleteSelection(model, selection));
+        setLevel(deleteSelection(diagram, selection));
         setSelection(new Set());
       } else if (mod && e.key.toLowerCase() === 'z') {
         e.preventDefault();
@@ -150,15 +173,26 @@ export function App() {
         redo();
       } else if (mod && e.key.toLowerCase() === 'a') {
         e.preventDefault();
-        setSelection(new Set([...model.blocks.map((b) => b.id), ...model.links.map((l) => l.id)]));
+        setSelection(new Set([...diagram.blocks.map((b) => b.id), ...diagram.links.map((l) => l.id)]));
       } else if (mod && e.key.toLowerCase() === 'c' && selection.size) {
-        clipRef.current = copySelection(model, selection);
+        clipRef.current = copySelection(diagram, selection);
         pasteCount.current = 0;
       } else if (mod && e.key.toLowerCase() === 'v' && clipRef.current?.blocks.length) {
         pasteCount.current++;
-        const r = paste(model, clipRef.current, 20 * pasteCount.current);
-        setModel(r.model);
+        const r = paste(diagram, clipRef.current, 20 * pasteCount.current);
+        setLevel(r.diagram);
         setSelection(new Set(r.ids));
+      } else if (mod && e.key.toLowerCase() === 'i' && selectedBlocks.length) {
+        e.preventDefault();
+        flipSelected();
+      } else if (mod && e.key.toLowerCase() === 'g') {
+        e.preventDefault();
+        group();
+      } else if (mod && e.key.toLowerCase() === 'm') {
+        e.preventDefault();
+        if (selectedSubsystem) setDialog({ kind: 'mask', id: selectedSubsystem.id });
+      } else if (e.key === 'Escape' && path.length) {
+        goTo(path.length - 1);
       } else if (mod && e.key.toLowerCase() === 's') {
         e.preventDefault();
         save();
@@ -188,29 +222,68 @@ export function App() {
     }
   };
 
+  const enter = (id: string) => {
+    const b = diagram.blocks.find((x) => x.id === id);
+    if (!b?.children) return;
+    setPath([...path, id]);
+    setSelection(new Set());
+    setDialog(null);
+    requestAnimationFrame(() => fitView(b.children!));
+  };
+
+  const goTo = (level: number) => {
+    const p = path.slice(0, level);
+    setPath(p);
+    setSelection(new Set());
+    requestAnimationFrame(() => fitView(getDiagram(model, p)));
+  };
+
+  const group = () => {
+    const r = createSubsystem(diagram, selection);
+    if (!r) return;
+    setLevel(r.diagram);
+    setSelection(new Set([r.id]));
+  };
+
   const openBlock = (id: string) => {
-    const b = model.blocks.find((x) => x.id === id);
+    const b = diagram.blocks.find((x) => x.id === id);
     if (!b) return;
-    if (b.type === 'Scope') setOpenScopes((s) => (s.includes(id) ? s : [...s, id]));
+    if (b.type === 'Scope') setOpenScopes((s) => (s.includes(prefix + id) ? s : [...s, prefix + id]));
+    else if (b.type === 'Subsystem' && !b.mask) enter(id);
     else setDialog({ kind: 'params', id });
   };
 
+  const flipSelected = () =>
+    setLevel({ ...diagram, blocks: diagram.blocks.map((b) => (selection.has(b.id) ? { ...b, flip: !b.flip } : b)) });
+
+  const updateBlock = (b: BlockModel) => setLevel({ ...diagram, blocks: diagram.blocks.map((x) => (x.id === b.id ? b : x)) });
+
+  const selectedBlocks = diagram.blocks.filter((b) => selection.has(b.id));
+  const selectedSubsystem = selectedBlocks.length === 1 && selectedBlocks[0].type === 'Subsystem' ? selectedBlocks[0] : undefined;
+
+  // Error inside a subsystem: highlight the block at this level that contains it.
+  let errorBlock: string | undefined;
+  if (error?.blockId?.startsWith(prefix)) errorBlock = error.blockId.slice(prefix.length).split('/')[0];
+
   const displays: Record<string, string> = {};
   if (result) {
-    for (const b of model.blocks) {
-      const log = result.logs[b.id];
+    for (const b of diagram.blocks) {
+      const log = result.logs[prefix + b.id];
       if (b.type === 'Display' && log?.t.length) displays[b.id] = String(+log.y[0][log.y[0].length - 1].toPrecision(5));
     }
   }
 
+  // Variables visible at this level: the workspace plus the masks of enclosing subsystems.
   let scope: Scope = {};
+  let scopeError: string | undefined;
   try {
-    scope = runWorkspace(model.workspace);
-  } catch {
-    // glyphs fall back to raw parameter text
+    scope = scopeAt(model, path, runWorkspace(model.workspace));
+  } catch (e) {
+    scopeError = (e as Error).message;
   }
 
-  const dialogBlock = dialog?.kind === 'params' ? model.blocks.find((b) => b.id === dialog.id) : undefined;
+  const dialogBlock = dialog && 'id' in dialog ? diagram.blocks.find((b) => b.id === dialog.id) : undefined;
+  const names = pathNames(model, path);
   const fixedSolver = !['ode45', 'ode23'].includes(model.settings.solver);
 
   return (
@@ -242,7 +315,18 @@ export function App() {
         <div className="tool-group">
           <button onClick={undo} disabled={!hist.past.length} title="Späť (Ctrl+Z)">↶</button>
           <button onClick={redo} disabled={!hist.future.length} title="Znova (Ctrl+Y)">↷</button>
-          <button onClick={() => fitView(model)} title="Zobraziť celý model">⤢</button>
+          <button onClick={() => fitView(diagram)} title="Zobraziť celý model">⤢</button>
+        </div>
+        <div className="tool-group">
+          <button onClick={flipSelected} disabled={!selectedBlocks.length} title="Zrkadliť vybrané bloky – vstupy vpravo (Ctrl+I)">⇄</button>
+          <button onClick={group} disabled={!selectedBlocks.length} title="Vytvoriť subsystém z vybraných blokov (Ctrl+G)">Subsystém</button>
+          <button
+            onClick={() => selectedSubsystem && setDialog({ kind: 'mask', id: selectedSubsystem.id })}
+            disabled={!selectedSubsystem}
+            title="Vytvoriť alebo upraviť masku vybraného subsystému (Ctrl+M)"
+          >
+            Maska
+          </button>
         </div>
         <div className="tool-group">
           <select
@@ -285,34 +369,50 @@ export function App() {
         <Library onAdd={(t) => add(t)} />
         <main ref={mainRef} className="main">
           <Canvas
-            model={model}
+            model={diagram}
             view={view}
             setView={setView}
             selection={selection}
             setSelection={setSelection}
-            onChange={setModel}
+            onChange={setLevel}
             onCheckpoint={checkpoint}
             onOpenBlock={openBlock}
             onDropBlock={(t, at) => add(t, at)}
-            errorBlock={error?.blockId}
+            errorBlock={errorBlock}
             displays={displays}
             scope={scope}
           />
-          {model.blocks.length === 0 && (
+          {path.length > 0 && (
+            <nav className="breadcrumb">
+              <button onClick={() => goTo(path.length - 1)} title="O úroveň vyššie (Esc)">↑</button>
+              <a onClick={() => goTo(0)}>{model.name}</a>
+              {names.map((n, i) => (
+                <span key={i}>
+                  {' › '}
+                  {i === names.length - 1 ? <b>{n}</b> : <a onClick={() => goTo(i + 1)}>{n}</a>}
+                </span>
+              ))}
+            </nav>
+          )}
+          {diagram.blocks.length === 0 && (
             <div className="empty-hint">
               Pretiahnite bloky z knižnice vľavo a prepojte ich ťahaním od výstupu (▷) k vstupu.
             </div>
           )}
           {openScopes
-            .map((id) => model.blocks.find((b) => b.id === id))
-            .map((b, i) => b && (
+            .map((fid) => [fid, findByPath(model, fid)] as const)
+            .map(([fid, b], i) => b && (
               <ScopeWindow
-                key={b.id}
+                key={fid}
                 index={i}
-                title={b.name}
-                log={result?.logs[b.id]}
-                onClose={() => setOpenScopes((s) => s.filter((x) => x !== b.id))}
-                onParams={() => setDialog({ kind: 'params', id: b.id })}
+                title={result?.logs[fid]?.name ?? b.name}
+                log={result?.logs[fid]}
+                onClose={() => setOpenScopes((s) => s.filter((x) => x !== fid))}
+                onParams={() => {
+                  const ids = fid.split('/');
+                  setPath(ids.slice(0, -1));
+                  setDialog({ kind: 'params', id: ids[ids.length - 1] });
+                }}
               />
             ))}
         </main>
@@ -333,11 +433,27 @@ export function App() {
 
       {dialog?.kind === 'params' && dialogBlock && (
         <ParamDialog
+          key={dialogBlock.id}
           block={dialogBlock}
-          workspace={model.workspace}
+          scope={scope}
+          scopeError={scopeError}
           onClose={() => setDialog(null)}
           onApply={(b) => {
-            setModel(pruneLinks({ ...model, blocks: model.blocks.map((x) => (x.id === b.id ? b : x)) }));
+            updateBlock(b);
+            setDialog(null);
+          }}
+          onOpenContents={dialogBlock.type === 'Subsystem' ? () => enter(dialogBlock.id) : undefined}
+          onEditMask={dialogBlock.type === 'Subsystem' ? () => setDialog({ kind: 'mask', id: dialogBlock.id }) : undefined}
+        />
+      )}
+      {dialog?.kind === 'mask' && dialogBlock && (
+        <MaskDialog
+          block={dialogBlock}
+          onClose={() => setDialog(null)}
+          onApply={(mask) => {
+            const params = { ...dialogBlock.params };
+            for (const mp of mask?.params ?? []) params[mp.name] ??= mp.default;
+            updateBlock({ ...dialogBlock, mask, params });
             setDialog(null);
           }}
         />
@@ -386,6 +502,11 @@ function HelpDialog({ onClose }: { onClose(): void }) {
               <tr><td>Zmazať</td><td>Delete</td></tr>
               <tr><td>Späť / znova</td><td>Ctrl+Z / Ctrl+Y</td></tr>
               <tr><td>Kopírovať / vložiť</td><td>Ctrl+C / Ctrl+V</td></tr>
+              <tr><td>Zrkadliť blok</td><td>Ctrl+I (vstupy vpravo, pre spätné väzby)</td></tr>
+              <tr><td>Subsystém z výberu</td><td>Ctrl+G</td></tr>
+              <tr><td>Otvoriť subsystém</td><td>dvojklik (maskovaný: tlačidlo Otvoriť obsah)</td></tr>
+              <tr><td>Späť o úroveň</td><td>Esc alebo ↑ v navigácii</td></tr>
+              <tr><td>Maska subsystému</td><td>Ctrl+M</td></tr>
               <tr><td>Spustiť</td><td>F5 alebo Ctrl+Enter</td></tr>
               <tr><td>Uložiť</td><td>Ctrl+S (súbor .psim)</td></tr>
             </tbody>

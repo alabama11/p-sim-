@@ -3,9 +3,9 @@
 
 import { useEffect, useRef, useState, type DragEvent, type MouseEvent, type PointerEvent as RPointerEvent } from 'react';
 import type { Scope } from '../sim/expr';
-import type { Model, PortRef } from '../sim/types';
+import type { Diagram, PortRef } from '../sim/types';
 import { Glyph } from './glyphs';
-import { blockSize, linkEnds, nearestPort, pointsToPath, portCounts, portPos, routeLink, type Pt } from './geometry';
+import { blockSize, linkRoute, nearestPort, pointsToPath, portCounts, portDir, portPos, routeLink, type Pt } from './geometry';
 
 export interface View {
   x: number;
@@ -23,13 +23,13 @@ type Drag =
   | { kind: 'linkPress'; linkId: string; start: Pt };
 
 interface Props {
-  model: Model;
+  model: Diagram;
   view: View;
   setView(v: View): void;
   selection: Set<string>;
   setSelection(s: Set<string>): void;
   /** record = false while a gesture is in progress (no undo entry). */
-  onChange(m: Model, record: boolean): void;
+  onChange(d: Diagram, record: boolean): void;
   onCheckpoint(): void;
   onOpenBlock(id: string): void;
   onDropBlock(type: string, at: Pt): void;
@@ -222,7 +222,8 @@ export function Canvas(p: Props) {
     const fb = model.blocks.find((b) => b.id === drag.from.block);
     if (fb) {
       const a = portPos(fb, drag.fromKind, drag.from.port);
-      preview = drag.fromKind === 'out' ? routeLink(a, drag.cur) : routeLink(drag.cur, a);
+      const dir = portDir(fb, drag.fromKind);
+      preview = drag.fromKind === 'out' ? routeLink(a, drag.cur, dir, dir) : routeLink(drag.cur, a, -dir, -dir);
     }
   }
 
@@ -253,9 +254,9 @@ export function Canvas(p: Props) {
       <rect width="100%" height="100%" fill="url(#grid)" />
       <g transform={`translate(${view.x},${view.y}) scale(${view.k})`}>
         {model.links.map((l) => {
-          const ends = linkEnds(model, l.src, l.dst);
-          if (!ends) return null;
-          const d = pointsToPath(routeLink(ends[0], ends[1]));
+          const route = linkRoute(model, l.src, l.dst);
+          if (!route) return null;
+          const d = pointsToPath(route);
           const sel = p.selection.has(l.id);
           return (
             <g key={l.id} onPointerDown={(e) => onLinkDown(e, l.id)} className="link-group">
@@ -277,7 +278,7 @@ export function Canvas(p: Props) {
                 onPointerDown={(e) => onBlockDown(e, b.id)}
               >
                 {b.type === 'Gain' ? (
-                  <path d={`M0,0 L${w},${h / 2} L0,${h} Z`} className="block-body" />
+                  <path d={b.flip ? `M${w},0 L0,${h / 2} L${w},${h} Z` : `M0,0 L${w},${h / 2} L0,${h} Z`} className="block-body" />
                 ) : (
                   <rect width={w} height={h} rx={4} className="block-body" />
                 )}
@@ -286,19 +287,21 @@ export function Canvas(p: Props) {
               <text x={w / 2} y={h + 13} textAnchor="middle" className="block-name">{b.name}</text>
               {Array.from({ length: inputs }, (_, i) => {
                 const y = (h * (i + 1)) / (inputs + 1);
+                const x = b.flip ? w : 0, s = b.flip ? -1 : 1;
                 return (
                   <g key={`i${i}`} className="port" onPointerDown={(e) => onPortDown(e, { block: b.id, port: i }, 'in')}>
-                    <circle cx={0} cy={y} r={8} className="port-hit" />
-                    <path d={`M-6,${y - 4} L-1,${y} L-6,${y + 4}`} className="port-mark" />
+                    <circle cx={x} cy={y} r={8} className="port-hit" />
+                    <path d={`M${x - 6 * s},${y - 4} L${x - s},${y} L${x - 6 * s},${y + 4}`} className="port-mark" />
                   </g>
                 );
               })}
               {Array.from({ length: outputs }, (_, i) => {
                 const y = (h * (i + 1)) / (outputs + 1);
+                const x = b.flip ? 0 : w, s = b.flip ? -1 : 1;
                 return (
                   <g key={`o${i}`} className="port" onPointerDown={(e) => onPortDown(e, { block: b.id, port: i }, 'out')}>
-                    <circle cx={w} cy={y} r={8} className="port-hit" />
-                    <path d={`M${w + 1},${y - 4} L${w + 6},${y} L${w + 1},${y + 4}`} className="port-mark" />
+                    <circle cx={x} cy={y} r={8} className="port-hit" />
+                    <path d={`M${x + s},${y - 4} L${x + 6 * s},${y} L${x + s},${y + 4}`} className="port-mark" />
                   </g>
                 );
               })}

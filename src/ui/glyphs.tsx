@@ -3,6 +3,7 @@
 import type { ReactNode } from 'react';
 import { evaluate, type Scope } from '../sim/expr';
 import type { BlockModel } from '../sim/types';
+import { subsystemPorts } from '../sim/flatten';
 import { portCounts } from './geometry';
 
 function short(s: string | undefined, max = 10) {
@@ -75,7 +76,7 @@ export function Glyph({ b, w, h, display, scope }: { b: BlockModel; w: number; h
         </g>
       );
     case 'Gain':
-      return <Txt x={w * 0.36} y={cy}>{short(p.K ?? '1', 6)}</Txt>;
+      return <Txt x={b.flip ? w * 0.64 : w * 0.36} y={cy}>{short(p.K ?? '1', 6)}</Txt>;
     case 'Sum':
     case 'Product': {
       const { inputs } = portCounts(b);
@@ -83,9 +84,9 @@ export function Glyph({ b, w, h, display, scope }: { b: BlockModel; w: number; h
       const sym = (c: string) => ({ '+': '+', '-': '−', '*': '×', '/': '÷' })[c] ?? c;
       return (
         <g>
-          <Txt x={cx + 5} y={cy} size={16}>{b.type === 'Sum' ? 'Σ' : 'Π'}</Txt>
+          <Txt x={b.flip ? cx - 5 : cx + 5} y={cy} size={16}>{b.type === 'Sum' ? 'Σ' : 'Π'}</Txt>
           {chars.slice(0, inputs).map((c, i) => (
-            <Txt key={i} x={8} y={(h * (i + 1)) / (inputs + 1)} size={11}>{sym(c)}</Txt>
+            <Txt key={i} x={b.flip ? w - 8 : 8} y={(h * (i + 1)) / (inputs + 1)} size={11}>{sym(c)}</Txt>
           ))}
         </g>
       );
@@ -137,6 +138,47 @@ export function Glyph({ b, w, h, display, scope }: { b: BlockModel; w: number; h
           <Path d={`M12,${cy + 4} Q${cx - 6},${T - 4} ${cx},${cy} T${w - 12},${cy - 4}`} />
         </g>
       );
+    case 'Subsystem': {
+      if (b.mask) return <Txt x={cx} y={cy} size={12}>{short(b.mask.title || b.name, 16)}</Txt>;
+      const { inports, outports } = subsystemPorts(b);
+      return (
+        <g>
+          {inports.map((p, i) => (
+            <Txt key={`i${i}`} x={b.flip ? w - 6 : 6} y={(h * (i + 1)) / (inports.length + 1)} size={9} anchor={b.flip ? 'end' : 'start'}>{short(p.name, 9)}</Txt>
+          ))}
+          {outports.map((p, i) => (
+            <Txt key={`o${i}`} x={b.flip ? 6 : w - 6} y={(h * (i + 1)) / (outports.length + 1)} size={9} anchor={b.flip ? 'start' : 'end'}>{short(p.name, 9)}</Txt>
+          ))}
+          {inports.length + outports.length === 0 && <Txt x={cx} y={cy} size={11}>Subsystem</Txt>}
+        </g>
+      );
+    }
+    case 'Inport':
+    case 'Outport':
+      return <Txt x={cx} y={cy} size={12}>{p.port ?? '1'}</Txt>;
+    case 'DeadZone':
+      return (
+        <g>
+          <path d={`M${L},${cy} H${R} M${cx},${T} V${B}`} className="glyph-axis" />
+          <Path d={`M${L},${B} L${cx - 8},${cy} H${cx + 8} L${R},${T}`} />
+        </g>
+      );
+    case 'RelationalOperator':
+      return <Txt x={cx} y={cy} size={14}>{(p.op ?? '<=').replace('<=', '≤').replace('>=', '≥').replace('~=', '≠')}</Txt>;
+    case 'LogicalOperator':
+      return <Txt x={cx} y={cy} size={11}>{p.op ?? 'AND'}</Txt>;
+    case 'MinMax':
+      return <Txt x={cx} y={cy} size={12}>{p.fn ?? 'min'}</Txt>;
+    case 'Derivative':
+      return <Fraction cx={cx} cy={cy} num="du" den="dt" size={12} />;
+    case 'TransportDelay':
+      return <Txt x={cx} y={cy} size={12}>{`e^(−${short(p.delay ?? '1', 4)}s)`}</Txt>;
+    case 'DiscreteTransferFcn':
+      return <Fraction cx={cx} cy={cy} num={formatPoly(p.num ?? '[1]', scope, 'z')} den={formatPoly(p.den ?? '[1 -0.5]', scope, 'z')} size={11} />;
+    case 'RandomNumber': {
+      const ys = [0.6, 0.2, 0.8, 0.4, 0.7, 0.3, 0.5];
+      return <Path d={ys.map((v, i) => `${i ? 'L' : 'M'}${L + ((R - L) * i) / 6},${T + (B - T) * v}`).join(' ')} />;
+    }
     case 'Display':
       return <Txt x={cx} y={cy} size={13}>{display ?? '—'}</Txt>;
     default:

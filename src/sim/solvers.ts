@@ -28,7 +28,10 @@ const bsA = [[], [1 / 2], [0, 3 / 4], [2 / 9, 1 / 3, 4 / 9]];
 const bsB = [2 / 9, 1 / 3, 4 / 9, 0];
 const bsBhat = [7 / 24, 1 / 4, 1 / 3, 1 / 8];
 
-export const TABLEAUS: Record<SolverName, Tableau> = {
+/** Explicit Runge-Kutta solvers; ode23s (Rosenbrock) is implemented separately in the engine. */
+export type ExplicitSolver = Exclude<SolverName, 'ode23s'>;
+
+export const TABLEAUS: Record<ExplicitSolver, Tableau> = {
   // Dormand-Prince 5(4)
   ode45: { c: [0, 1 / 5, 3 / 10, 4 / 5, 8 / 9, 1, 1], a: dpA, b: dpB, e: dpB.map((v, i) => v - dpBhat[i]), order: 4 },
   // Bogacki-Shampine 3(2)
@@ -48,6 +51,7 @@ export const TABLEAUS: Record<SolverName, Tableau> = {
 export const SOLVER_LABELS: Record<SolverName, string> = {
   ode45: 'ode45 (Dormand-Prince, premenlivý krok)',
   ode23: 'ode23 (Bogacki-Shampine, premenlivý krok)',
+  ode23s: 'ode23s (Rosenbrock, tuhé systémy)',
   ode1: 'ode1 (Euler, pevný krok)',
   ode2: 'ode2 (Heun, pevný krok)',
   ode3: 'ode3 (Bogacki-Shampine, pevný krok)',
