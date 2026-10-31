@@ -180,7 +180,30 @@ export function Glyph({ b, w, h, display, scope }: { b: BlockModel; w: number; h
       return <Path d={ys.map((v, i) => `${i ? 'L' : 'M'}${L + ((R - L) * i) / 6},${T + (B - T) * v}`).join(' ')} />;
     }
     case 'Display':
-      return <Txt x={cx} y={cy} size={13}>{display ?? '—'}</Txt>;
+      return <Txt x={cx} y={cy} size={display && display.length > 12 ? 10 : 13}>{display ?? '—'}</Txt>;
+    case 'Terminator':
+      return <Path d={`M${L},${cy} H${cx} M${cx},${T + 2} V${B - 2}`} />;
+    case 'Unsupported':
+      return (
+        <g>
+          <Txt x={cx} y={cy - 7} size={14}>?</Txt>
+          <Txt x={cx} y={cy + 9} size={9}>{short(p.kind ?? '', 14)}</Txt>
+        </g>
+      );
+    case 'Mux':
+    case 'Demux':
+      return null; // drawn as a solid bar by the canvas
+    case 'Fcn':
+      return <Txt x={cx} y={cy} size={11}>{short(p.expr ?? 'u^2', 16)}</Txt>;
+    case 'OctaveFcn': {
+      const first = (p.code ?? '').split('\n').map((l) => l.replace(/[%#].*$/, '').trim()).find(Boolean) ?? '';
+      return (
+        <g>
+          <Txt x={cx} y={cy - 8} size={13}>fcn</Txt>
+          <text x={cx} y={cy + 12} textAnchor="middle" dominantBaseline="middle" className="glyph-code">{short(first, 18)}</text>
+        </g>
+      );
+    }
     default:
       return <Txt x={cx} y={cy} size={10}>{b.type}</Txt>;
   }

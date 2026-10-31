@@ -4,9 +4,9 @@
 // states at their sample hits, then integrate continuous states to the next major
 // time. Steps are shortened to land exactly on sample hits and source discontinuities.
 
-import { BLOCKS, type BlockRuntime, type Params, type StepCtx } from './blocks';
+import { BLOCKS, type BlockDef, type BlockRuntime, type Params, type StepCtx } from './blocks';
 import { evaluate, runWorkspace, type Scope } from './expr';
-import { FlattenError, flatten } from './flatten';
+import { FlattenError, flatten, type FlatBlock } from './flatten';
 import { FIXED_STEP_SOLVERS, type Model, type SolverName } from './types';
 import { TABLEAUS, type Tableau } from './solvers';
 
@@ -21,9 +21,10 @@ interface CBlock {
   name: string;
   type: string;
   rt: BlockRuntime;
-  /** Signal index feeding each input, or -1 when unconnected (reads 0). */
+  /** Signal index feeding each input element, or -1 when unconnected (reads 0). */
   inSig: number[];
-  outSig: number; // first signal index of this block's outputs
+  /** Signal index written by each output element. */
+  outSig: number[];
   u: number[];
   y: number[];
   xOff: number;
@@ -31,6 +32,8 @@ interface CBlock {
   Ts?: number;
   k: number; // number of sample hits so far
   hitNow: boolean;
+  /** Channel names of a sink: u1, u2(1), u2(2), ... */
+  labels?: string[];
 }
 
 export interface Compiled {
@@ -40,6 +43,8 @@ export interface Compiled {
   x0: Float64Array;
   scope: Scope;
   warnings: string[];
+  /** Width of each output port of each flat block, keyed "blockId:port" (for the editor). */
+  widths: Record<string, number>;
 }
 
 export interface SignalLog {
@@ -48,6 +53,7 @@ export interface SignalLog {
   t: number[];
   /** y[channel][sample] */
   y: number[][];
+  labels: string[];
 }
 
 export interface SimResult {
@@ -57,6 +63,85 @@ export interface SimResult {
   rejected: number;
   tEnd: number;
   elapsedMs: number;
+  widths: Record<string, number>;
+}
+
+interface Pre {
+  fb: FlatBlock;
+  def: BlockDef;
+  params: Params;
+  /** Source of each input port: index into pre[] and port, or null when unconnected. */
+  src: ({ b: number; port: number } | null)[];
+  outW: (number | undefined)[];
+}
+
+function callWide(pb: Pre, inW: number[]): number[] | null {
+  try {
+    return pb.def.wide!(pb.params, inW, pb.fb.scope);
+  } catch (e) {
+    throw new SimError(`Blok „${pb.fb.name}“: ${(e as Error).message}`, pb.fb.id);
+  }
+}
+
+const sameW = (a: (number | undefined)[], b: (number | undefined)[]) => a.length === b.length && a.every((v, i) => v === b[i]);
+
+/**
+ * Signal widths (vector lengths) of every output port. Most blocks work element by
+ * element: their width is the largest width among their inputs and their sliceable
+ * parameters (Constant [1 2 3] has width 3). Wide blocks such as Mux decide their output
+ * widths from all input widths. Widths are propagated to a fixed point; feedback loops
+ * without any width information default to scalars.
+ */
+function inferWidths(pre: Pre[]) {
+  const inW = (pb: Pre) => pb.src.map((s) => (s ? pre[s.b].outW[s.port] : 1));
+  const step = (pb: Pre): (number | undefined)[] => {
+    const w = inW(pb);
+    if (pb.def.wide) {
+      if (w.some((v) => v === undefined)) return pb.outW;
+      const out = callWide(pb, w as number[]);
+      if (out) return out;
+    }
+    let width: number | undefined = pb.src.length === 0 ? 1 : undefined;
+    for (const v of w) if (v !== undefined) width = Math.max(width ?? 1, v);
+    for (const name of pb.def.slice ?? []) {
+      const v = pb.params[name];
+      if (typeof v !== 'string' && v.length > 1) width = Math.max(width ?? 1, v.length);
+    }
+    // Never forget a width already found (e.g. a scalar assumed for a loop).
+    return width === undefined ? pb.outW : pb.outW.map(() => width);
+  };
+  const limit = 20 + 4 * pre.length;
+  for (let iter = 0; ; iter++) {
+    if (iter > limit) throw new SimError('Šírky signálov sa nedajú určiť: slučka cez Mux stále zväčšuje vektor.');
+    let changed = false;
+    for (const pb of pre) {
+      const nw = step(pb);
+      if (!sameW(nw, pb.outW)) { pb.outW = nw; changed = true; }
+    }
+    if (changed) continue;
+    // A loop with no width information: assume scalars and propagate again.
+    const open = pre.find((pb) => pb.outW.some((v) => v === undefined));
+    if (!open) break;
+    open.outW = open.outW.map((v) => v ?? 1);
+  }
+  // Element-wise blocks: every input and sliced parameter must be scalar or full width.
+  for (const pb of pre) {
+    const w = inW(pb) as number[];
+    if (pb.def.wide && callWide(pb, w)) continue;
+    const width = pb.outW[0] ?? Math.max(1, ...w);
+    w.forEach((v, q) => {
+      if (v !== 1 && v !== width) {
+        throw new SimError(`Blok „${pb.fb.name}“: vstup ${q + 1} má šírku ${v}, ostatné signály majú šírku ${width}.`, pb.fb.id);
+      }
+    });
+    for (const name of pb.def.slice ?? []) {
+      const v = pb.params[name];
+      if (typeof v !== 'string' && v.length !== 1 && v.length !== width) {
+        const label = pb.def.params.find((d) => d.name === name)?.label ?? name;
+        throw new SimError(`Blok „${pb.fb.name}“: parameter „${label}“ má ${v.length} prvkov, signál má šírku ${width}.`, pb.fb.id);
+      }
+    }
+  }
 }
 
 export function compile(model: Model): Compiled {
@@ -68,11 +153,6 @@ export function compile(model: Model): Compiled {
   }
 
   const warnings: string[] = [];
-  const blocks: CBlock[] = [];
-  const byId = new Map<string, CBlock>();
-  let nSignals = 0;
-  let nx = 0;
-
   let flat: ReturnType<typeof flatten>;
   try {
     flat = flatten(model, scope);
@@ -80,14 +160,16 @@ export function compile(model: Model): Compiled {
     throw new SimError((e as Error).message, e instanceof FlattenError ? e.blockId : undefined);
   }
 
-  for (const fb of flat.blocks) {
+  // 1. Evaluate parameters.
+  const pre: Pre[] = flat.blocks.map((fb) => {
     const bm = fb.block;
     const def = BLOCKS[bm.type];
     if (!def) throw new SimError(`Neznámy typ bloku „${bm.type}“`, fb.id);
+    if (bm.type === 'Unsupported') warnings.push(`Blok „${fb.name}“ (${bm.params.kind}) nie je podporovaný, jeho výstup je 0.`);
     const params: Params = {};
     for (const pd of def.params) {
       const raw = bm.params[pd.name] ?? pd.default;
-      if (pd.kind === 'text' || pd.kind === 'choice') {
+      if (pd.kind === 'text' || pd.kind === 'choice' || pd.kind === 'code') {
         params[pd.name] = raw;
         continue;
       }
@@ -97,48 +179,81 @@ export function compile(model: Model): Compiled {
         throw new SimError(`Blok „${fb.name}“, parameter „${pd.label}“: ${(e as Error).message}`, fb.id);
       }
     }
-    let rt: BlockRuntime;
-    try {
-      rt = def.create(params);
-    } catch (e) {
-      throw new SimError(`Blok „${fb.name}“: ${(e as Error).message}`, fb.id);
-    }
-    const { inputs, outputs } = fb;
-    const cb: CBlock = {
-      id: fb.id, name: fb.name, rt, type: bm.type,
-      inSig: new Array(inputs).fill(-1),
-      outSig: nSignals,
-      u: new Array(inputs).fill(0),
-      y: new Array(outputs).fill(0),
-      xOff: nx,
-      nx: rt.nx ?? 0,
-      Ts: rt.sampleTime,
-      k: 0,
-      hitNow: false,
-    };
-    nSignals += outputs;
-    nx += cb.nx;
-    blocks.push(cb);
-    byId.set(fb.id, cb);
+    return { fb, def, params, src: new Array(fb.inputs).fill(null), outW: new Array(fb.outputs).fill(undefined) };
+  });
+  const index = new Map(pre.map((pb, i) => [pb.fb.id, i]));
+  for (const l of flat.links) {
+    const si = index.get(l.src.block), di = index.get(l.dst.block);
+    if (si === undefined || di === undefined) continue;
+    if (l.src.port >= pre[si].fb.outputs || l.dst.port >= pre[di].fb.inputs) continue;
+    pre[di].src[l.dst.port] = { b: si, port: l.src.port };
+  }
+  for (const pb of pre) {
+    // A top-level Inport has no outer signal by design.
+    if (pb.fb.block.type === 'Inport' && !pb.fb.id.includes('/')) continue;
+    pb.src.forEach((s, i) => {
+      if (!s) warnings.push(`Blok „${pb.fb.name}“: vstup ${i + 1} nie je pripojený, použije sa 0.`);
+    });
   }
 
-  for (const l of flat.links) {
-    const src = byId.get(l.src.block), dst = byId.get(l.dst.block);
-    if (!src || !dst || l.src.port >= src.y.length || l.dst.port >= dst.inSig.length) continue;
-    dst.inSig[l.dst.port] = src.outSig + l.src.port;
-  }
-  for (const b of blocks) {
-    // A top-level Inport has no outer signal by design.
-    if (b.type === 'Inport' && !b.id.includes('/')) continue;
-    b.inSig.forEach((s, i) => {
-      if (s < 0) warnings.push(`Blok „${b.name}“: vstup ${i + 1} nie je pripojený, použije sa 0.`);
-    });
+  // 2. Widths and signal allocation.
+  inferWidths(pre);
+  let nSignals = 0;
+  const outSignals = pre.map((pb) => pb.outW.map((w) => Array.from({ length: w! }, () => nSignals++)));
+  const widths: Record<string, number> = {};
+  pre.forEach((pb) => pb.outW.forEach((w, p) => (widths[`${pb.fb.id}:${p}`] = w!)));
+
+  // 3. Runtimes: one per wide block, one per element for element-wise blocks.
+  const blocks: CBlock[] = [];
+  let nx = 0;
+  const make = (pb: Pre, params: Params, inSig: number[], outSig: number[], inW?: number[]) => {
+    let rt: BlockRuntime;
+    try {
+      rt = pb.def.create(params, inW, pb.fb.scope);
+    } catch (e) {
+      throw new SimError(`Blok „${pb.fb.name}“: ${(e as Error).message}`, pb.fb.id);
+    }
+    const cb: CBlock = {
+      id: pb.fb.id, name: pb.fb.name, rt, type: pb.fb.block.type,
+      inSig, outSig,
+      u: new Array(inSig.length).fill(0),
+      y: new Array(outSig.length).fill(0),
+      xOff: nx, nx: rt.nx ?? 0, Ts: rt.sampleTime, k: 0, hitNow: false,
+    };
+    nx += cb.nx;
+    blocks.push(cb);
+    return cb;
+  };
+  for (let bi = 0; bi < pre.length; bi++) {
+    const pb = pre[bi];
+    const inW = pb.src.map((s) => (s ? pre[s.b].outW[s.port]! : 1));
+    if (pb.def.wide && callWide(pb, inW)) {
+      const inSig = pb.src.flatMap((s, q) => (s ? outSignals[s.b][s.port] : new Array(inW[q]).fill(-1)));
+      const cb = make(pb, pb.params, inSig, outSignals[bi].flat(), inW);
+      cb.labels = inW.flatMap((w, q) => (w === 1 ? [`u${q + 1}`] : Array.from({ length: w }, (_, i) => `u${q + 1}(${i + 1})`)));
+      continue;
+    }
+    const width = pb.outW[0] ?? Math.max(1, ...inW);
+    for (let i = 0; i < width; i++) {
+      const params: Params = { ...pb.params };
+      for (const name of pb.def.slice ?? []) {
+        const v = params[name];
+        if (typeof v !== 'string' && v.length === width && width > 1) params[name] = [v[i]];
+      }
+      const inSig = pb.src.map((s) => {
+        if (!s) return -1;
+        const sig = outSignals[s.b][s.port];
+        return sig.length === 1 ? sig[0] : sig[i];
+      });
+      const cb = make(pb, params, inSig, outSignals[bi].map((sig) => sig[i]));
+      if (pb.def.wide === undefined && cb.rt.sink) cb.labels = inSig.map((_, q) => `u${q + 1}`);
+    }
   }
 
   const x0 = new Float64Array(nx);
   for (const b of blocks) b.rt.x0?.forEach((v, i) => (x0[b.xOff + i] = v));
 
-  return { order: sortBlocks(blocks), nx, nSignals, x0, scope, warnings };
+  return { order: sortBlocks(blocks), nx, nSignals, x0, scope, warnings, widths };
 }
 
 /**
@@ -147,7 +262,7 @@ export function compile(model: Model): Compiled {
  */
 function sortBlocks(blocks: CBlock[]): CBlock[] {
   const ownerOf = new Map<number, CBlock>();
-  for (const b of blocks) b.y.forEach((_, i) => ownerOf.set(b.outSig + i, b));
+  for (const b of blocks) for (const s of b.outSig) ownerOf.set(s, b);
   const deps = new Map<CBlock, Set<CBlock>>();
   const users = new Map<CBlock, CBlock[]>();
   for (const b of blocks) {
@@ -229,7 +344,7 @@ export function simulate(model: Model, opts: SimOptions = {}): SimResult {
   const ctx: StepCtx = { major: true, hit: false };
   const sinks = c.order.filter((b) => b.rt.sink);
   const logs: Record<string, SignalLog> = {};
-  for (const b of sinks) logs[b.id] = { blockId: b.id, name: b.name, t: [], y: b.u.map(() => []) };
+  for (const b of sinks) logs[b.id] = { blockId: b.id, name: b.name, t: [], y: b.u.map(() => []), labels: b.labels ?? b.u.map((_, i) => `u${i + 1}`) };
 
   // Per-block views into the state arrays, cached per array.
   const viewCache = new Map<Float64Array, Float64Array[]>();
@@ -255,7 +370,7 @@ export function simulate(model: Model, opts: SimOptions = {}): SimResult {
       ctx.hit = major && b.hitNow;
       // A discrete block computes its output only at its sample hits and holds it in between.
       if (b.Ts === undefined || ctx.hit) b.rt.output(t, xv[i], b.u, b.y, ctx);
-      for (let j = 0; j < b.y.length; j++) signals[b.outSig + j] = b.y[j];
+      for (let j = 0; j < b.y.length; j++) signals[b.outSig[j]] = b.y[j];
     }
     // Non-feedthrough blocks may run before their sources; give everyone the final inputs.
     for (const b of c.order) gather(b);
@@ -506,7 +621,7 @@ export function simulate(model: Model, opts: SimOptions = {}): SimResult {
     }
   }
 
-  return { logs, warnings: c.warnings, steps, rejected, tEnd: t, elapsedMs: performance.now() - started };
+  return { logs, warnings: c.warnings, steps, rejected, tEnd: t, elapsedMs: performance.now() - started, widths: c.widths };
 }
 
 /** In-place LU factorization with partial pivoting of the n×n row-major matrix A. */

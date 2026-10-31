@@ -40,11 +40,22 @@ export function ScopeWindow({ title, log, index, onClose, onParams }: Props) {
     const opts: uPlot.Options = {
       width: el.clientWidth,
       height: el.clientHeight - LEGEND_H,
-      scales: { x: { time: false } },
+      scales: {
+        x: { time: false },
+        // A nearly constant signal (e.g. conserved energy) is shown flat, not as magnified noise.
+        y: {
+          range: (_u, min, max) => {
+            const mag = Math.max(Math.abs(min), Math.abs(max));
+            if (max - min < 0.02 * mag) return [min - 0.05 * mag, max + 0.05 * mag];
+            if (max - min < 1e-12) return [min - 1, max + 1];
+            return uPlot.rangeNum(min, max, 0.1, true);
+          },
+        },
+      },
       axes: [{ ...axis, label: 't [s]' }, { ...axis }],
       series: [
         { label: 't' },
-        ...log.y.map((_, i) => ({ label: `u${i + 1}`, stroke: COLORS[i % COLORS.length], width: 1.5 })),
+        ...log.y.map((_, i) => ({ label: log.labels?.[i] ?? `u${i + 1}`, stroke: COLORS[i % COLORS.length], width: 1.5 })),
       ],
       cursor: { drag: { x: true, y: true, uni: 20 } },
       legend: { live: true },
@@ -60,7 +71,7 @@ export function ScopeWindow({ title, log, index, onClose, onParams }: Props) {
 
   const exportCsv = () => {
     if (!log) return;
-    const header = ['t', ...log.y.map((_, i) => `u${i + 1}`)].join(',');
+    const header = ["t", ...log.y.map((_, i) => log.labels?.[i] ?? `u${i + 1}`)].join(",");
     const rows = log.t.map((t, i) => [t, ...log.y.map((ch) => ch[i])].join(','));
     const blob = new Blob([[header, ...rows].join('\n')], { type: 'text/csv' });
     const a = document.createElement('a');

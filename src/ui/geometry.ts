@@ -24,6 +24,12 @@ const BASE_SIZE: Record<string, { w: number; h: number }> = {
   LogicalOperator: { w: 56, h: 44 },
   DiscreteTransferFcn: { w: 96, h: 50 },
   TransportDelay: { w: 70, h: 44 },
+  Mux: { w: 8, h: 44 },
+  Terminator: { w: 30, h: 30 },
+  Unsupported: { w: 90, h: 44 },
+  Demux: { w: 8, h: 44 },
+  Fcn: { w: 100, h: 40 },
+  OctaveFcn: { w: 110, h: 60 },
 };
 
 export function portCounts(b: BlockModel) {
