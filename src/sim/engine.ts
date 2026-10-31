@@ -6,6 +6,7 @@
 
 import { BLOCKS, type BlockRuntime, type Params, type StepCtx } from './blocks';
 import { evaluate, runWorkspace, type Scope } from './expr';
+import { FlattenError, flatten } from './flatten';
 import { FIXED_STEP_SOLVERS, type Model, type SolverName } from './types';
 import { TABLEAUS, type Tableau } from './solvers';
 
@@ -18,6 +19,7 @@ export class SimError extends Error {
 interface CBlock {
   id: string;
   name: string;
+  type: string;
   rt: BlockRuntime;
   /** Signal index feeding each input, or -1 when unconnected (reads 0). */
   inSig: number[];
@@ -71,9 +73,17 @@ export function compile(model: Model): Compiled {
   let nSignals = 0;
   let nx = 0;
 
-  for (const bm of model.blocks) {
+  let flat: ReturnType<typeof flatten>;
+  try {
+    flat = flatten(model, scope);
+  } catch (e) {
+    throw new SimError((e as Error).message, e instanceof FlattenError ? e.blockId : undefined);
+  }
+
+  for (const fb of flat.blocks) {
+    const bm = fb.block;
     const def = BLOCKS[bm.type];
-    if (!def) throw new SimError(`Neznámy typ bloku „${bm.type}“`, bm.id);
+    if (!def) throw new SimError(`Neznámy typ bloku „${bm.type}“`, fb.id);
     const params: Params = {};
     for (const pd of def.params) {
       const raw = bm.params[pd.name] ?? pd.default;
@@ -82,20 +92,20 @@ export function compile(model: Model): Compiled {
         continue;
       }
       try {
-        params[pd.name] = evaluate(raw, scope);
+        params[pd.name] = evaluate(raw, fb.scope);
       } catch (e) {
-        throw new SimError(`Blok „${bm.name}“, parameter „${pd.label}“: ${(e as Error).message}`, bm.id);
+        throw new SimError(`Blok „${fb.name}“, parameter „${pd.label}“: ${(e as Error).message}`, fb.id);
       }
     }
     let rt: BlockRuntime;
     try {
       rt = def.create(params);
     } catch (e) {
-      throw new SimError(`Blok „${bm.name}“: ${(e as Error).message}`, bm.id);
+      throw new SimError(`Blok „${fb.name}“: ${(e as Error).message}`, fb.id);
     }
-    const { inputs, outputs } = def.ports(bm.params);
+    const { inputs, outputs } = fb;
     const cb: CBlock = {
-      id: bm.id, name: bm.name, rt,
+      id: fb.id, name: fb.name, rt, type: bm.type,
       inSig: new Array(inputs).fill(-1),
       outSig: nSignals,
       u: new Array(inputs).fill(0),
@@ -109,15 +119,17 @@ export function compile(model: Model): Compiled {
     nSignals += outputs;
     nx += cb.nx;
     blocks.push(cb);
-    byId.set(bm.id, cb);
+    byId.set(fb.id, cb);
   }
 
-  for (const l of model.links) {
+  for (const l of flat.links) {
     const src = byId.get(l.src.block), dst = byId.get(l.dst.block);
     if (!src || !dst || l.src.port >= src.y.length || l.dst.port >= dst.inSig.length) continue;
     dst.inSig[l.dst.port] = src.outSig + l.src.port;
   }
   for (const b of blocks) {
+    // A top-level Inport has no outer signal by design.
+    if (b.type === 'Inport' && !b.id.includes('/')) continue;
     b.inSig.forEach((s, i) => {
       if (s < 0) warnings.push(`Blok „${b.name}“: vstup ${i + 1} nie je pripojený, použije sa 0.`);
     });
@@ -207,7 +219,10 @@ export function simulate(model: Model, opts: SimOptions = {}): SimResult {
   if (!(rtol > 0) || !(atol > 0)) throw new SimError('Tolerancie musia byť kladné.');
   const maxSteps = opts.maxSteps ?? 500_000;
   const refine = fixed ? 1 : Math.max(1, opts.refine ?? 4);
-  const tableau: Tableau = TABLEAUS[solver];
+  const implicit = solver === 'ode23s';
+  // ode23s needs no tableau; ode23's provides the stage buffers and Hermite data it shares.
+  const tableau: Tableau = TABLEAUS[solver === 'ode23s' ? 'ode23' : solver];
+  const order = implicit ? 2 : tableau.order;
   const tTol = 1e-10 * Math.max(1, Math.abs(tf), Math.abs(t0));
 
   const signals = new Float64Array(c.nSignals);
@@ -310,15 +325,99 @@ export function simulate(model: Model, opts: SimOptions = {}): SimResult {
     return m;
   };
 
+  // ---- Rosenbrock ode23s (Shampine & Reichelt), Jacobian by finite differences ----
+  const J = new Float64Array(nx * nx);
+  const W = new Float64Array(nx * nx);
+  const piv = new Int32Array(nx);
+  const dfdt = new Float64Array(nx);
+  const col = new Float64Array(nx);
+  const r1 = new Float64Array(nx), r2 = new Float64Array(nx), r3 = new Float64Array(nx);
+  const F1 = new Float64Array(nx), F2 = new Float64Array(nx);
+  const dR = 1 / (2 + Math.SQRT2), e32 = 6 + Math.SQRT2;
+  let jacT = NaN; // time of the current Jacobian
+
+  const jacobian = (t: number) => {
+    const F0 = k[0];
+    for (let j = 0; j < nx; j++) {
+      const del = Math.sqrt(Number.EPSILON) * Math.max(Math.abs(x[j]), atol / rtol, 1e-5);
+      xs.set(x);
+      xs[j] += del;
+      f(t, xs, col);
+      for (let i = 0; i < nx; i++) J[i * nx + j] = (col[i] - F0[i]) / del;
+    }
+    const dt = Math.sqrt(Number.EPSILON) * Math.max(Math.abs(t), 1e-5);
+    f(t + dt, x, col);
+    for (let i = 0; i < nx; i++) dfdt[i] = (col[i] - F0[i]) / dt;
+    jacT = t;
+  };
+
+  const rosenbrockStep = (t: number, h: number) => {
+    if (jacT !== t) jacobian(t);
+    const F0 = k[0];
+    for (let i = 0; i < nx * nx; i++) W[i] = -h * dR * J[i];
+    for (let i = 0; i < nx; i++) W[i * nx + i] += 1;
+    if (!luFactor(W, nx, piv)) throw new SimError(`Singulárna matica pri ode23s v čase t = ${t.toPrecision(6)}.`);
+    for (let i = 0; i < nx; i++) r1[i] = F0[i] + h * dR * dfdt[i];
+    luSolve(W, nx, piv, r1); // k1
+    for (let i = 0; i < nx; i++) xs[i] = x[i] + 0.5 * h * r1[i];
+    f(t + 0.5 * h, xs, F1);
+    for (let i = 0; i < nx; i++) r2[i] = F1[i] - r1[i];
+    luSolve(W, nx, piv, r2);
+    for (let i = 0; i < nx; i++) {
+      r2[i] += r1[i]; // k2
+      xNew[i] = x[i] + h * r2[i];
+    }
+    f(t + h, xNew, F2);
+    for (let i = 0; i < nx; i++) r3[i] = F2[i] - e32 * (r2[i] - F1[i]) - 2 * (r1[i] - F0[i]) + h * dR * dfdt[i];
+    luSolve(W, nx, piv, r3); // k3
+    for (let i = 0; i < nx; i++) xErr[i] = (h / 6) * (r1[i] - 2 * r2[i] + r3[i]);
+  };
+
+  // ---- Zero crossings ----
+  const zcBlocks = c.order.filter((b) => b.rt.nzc);
+  const nz = zcBlocks.reduce((n, b) => n + b.rt.nzc!, 0);
+  const zStart = new Float64Array(nz), zEnd = new Float64Array(nz), zMid = new Float64Array(nz);
+  const zBuf: number[] = [];
+  /** Zero-crossing values for the inputs currently gathered in every block. */
+  const evalZc = (t: number, out: Float64Array) => {
+    let o = 0;
+    for (const b of zcBlocks) {
+      b.rt.zc!(t, b.u, zBuf);
+      for (let i = 0; i < b.rt.nzc!; i++) out[o++] = zBuf[i];
+    }
+  };
+  const crossed = (a: Float64Array, b: Float64Array) => {
+    for (let i = 0; i < nz; i++) if ((a[i] < 0 && b[i] >= 0) || (a[i] > 0 && b[i] <= 0)) return true;
+    return false;
+  };
+  const hermite = (s: number, h: number, out: Float64Array) => {
+    const h00 = 2 * s ** 3 - 3 * s ** 2 + 1, h10 = s ** 3 - 2 * s ** 2 + s;
+    const h01 = -2 * s ** 3 + 3 * s ** 2, h11 = s ** 3 - s ** 2;
+    for (let i = 0; i < nx; i++) out[i] = h00 * x[i] + h10 * h * k[0][i] + h01 * xNew[i] + h11 * h * fEnd[i];
+  };
+  /** Fraction of the step (0, 1] just past the first zero crossing, or 0 when none occurs. */
+  const locateCrossing = (t: number, h: number): number => {
+    f(t + h, xNew, fEnd);
+    evalZc(t + h, zEnd);
+    if (!crossed(zStart, zEnd)) return 0;
+    let lo = 0, hi = 1;
+    for (let it = 0; it < 60 && (hi - lo) * h > tTol; it++) {
+      const mid = (lo + hi) / 2;
+      hermite(mid, h, xRef);
+      outputs(t + mid * h, xRef, false);
+      evalZc(t + mid * h, zMid);
+      if (crossed(zStart, zMid)) hi = mid; else lo = mid;
+    }
+    return hi;
+  };
+
   /** Logs `refine - 1` interior points of the step using cubic Hermite interpolation of the states. */
   const logRefined = (t: number, h: number) => {
     if (refine <= 1 || sinks.length === 0) return;
     f(t + h, xNew, fEnd);
     for (let j = 1; j < refine; j++) {
       const s = j / refine;
-      const h00 = 2 * s ** 3 - 3 * s ** 2 + 1, h10 = s ** 3 - 2 * s ** 2 + s;
-      const h01 = -2 * s ** 3 + 3 * s ** 2, h11 = s ** 3 - s ** 2;
-      for (let i = 0; i < nx; i++) xRef[i] = h00 * x[i] + h10 * h * k[0][i] + h01 * xNew[i] + h11 * h * fEnd[i];
+      hermite(s, h, xRef);
       outputs(t + s * h, xRef, false);
       logSinks(t + s * h);
     }
@@ -333,6 +432,8 @@ export function simulate(model: Model, opts: SimOptions = {}): SimResult {
     for (const b of c.order) b.hitNow = b.Ts !== undefined && Math.abs(t - (t0 + b.k * b.Ts)) <= tTol;
     outputs(t, x, true);
     logSinks(t);
+    for (const b of c.order) b.rt.onMajor?.(t, b.u);
+    if (nz) evalZc(t, zStart);
     for (const b of c.order) {
       if (!b.hitNow) continue;
       b.rt.update?.(t, b.u);
@@ -368,22 +469,31 @@ export function simulate(model: Model, opts: SimOptions = {}): SimResult {
       [x, xNew] = [xNew, x];
     } else {
       if (hNext === 0) hNext = initialStep(x, k[0], atol, rtol, hMax);
+      let hZc = 0; // step shortened to end just past a zero crossing
       for (;;) {
-        let h = Math.min(hNext, hMax);
+        let h = hZc || Math.min(hNext, hMax);
         const landing = t + h >= tBreak - tTol;
         if (landing) h = tBreak - t;
-        rkStep(t, h);
+        if (implicit) rosenbrockStep(t, h); else rkStep(t, h);
         const err = errorNorm();
         if (!isFinite(err)) throw new SimError(`Simulácia divergovala v čase t = ${t.toPrecision(6)}.`);
-        const factor = err === 0 ? 5 : Math.min(5, Math.max(0.2, 0.9 * err ** (-1 / (tableau.order + 1))));
+        const factor = err === 0 ? 5 : Math.min(5, Math.max(0.2, 0.9 * err ** (-1 / (order + 1))));
         if (err <= 1) {
+          if (nz && !hZc) {
+            const s = locateCrossing(t, h);
+            if (s > 0 && s * h < h - tTol) {
+              hZc = s * h;
+              continue;
+            }
+          }
           logRefined(t, h);
           t = landing ? tBreak : t + h;
           [x, xNew] = [xNew, x];
-          // Do not let a step shortened by an event shrink the next proposal.
-          hNext = landing ? Math.max(hNext, h * factor) : h * factor;
+          // Do not let a step shortened by an event or crossing shrink the next proposal.
+          hNext = landing || hZc ? Math.max(hNext, h * factor) : h * factor;
           break;
         }
+        hZc = 0;
         rejected++;
         hNext = h * Math.max(0.1, factor);
         if (hNext < 16 * Number.EPSILON * Math.max(1, Math.abs(t))) {
@@ -397,6 +507,36 @@ export function simulate(model: Model, opts: SimOptions = {}): SimResult {
   }
 
   return { logs, warnings: c.warnings, steps, rejected, tEnd: t, elapsedMs: performance.now() - started };
+}
+
+/** In-place LU factorization with partial pivoting of the n×n row-major matrix A. */
+function luFactor(A: Float64Array, n: number, piv: Int32Array): boolean {
+  for (let k = 0; k < n; k++) {
+    let p = k;
+    for (let i = k + 1; i < n; i++) if (Math.abs(A[i * n + k]) > Math.abs(A[p * n + k])) p = i;
+    piv[k] = p;
+    if (A[p * n + k] === 0) return false;
+    if (p !== k) for (let j = 0; j < n; j++) [A[k * n + j], A[p * n + j]] = [A[p * n + j], A[k * n + j]];
+    for (let i = k + 1; i < n; i++) {
+      const m = (A[i * n + k] /= A[k * n + k]);
+      for (let j = k + 1; j < n; j++) A[i * n + j] -= m * A[k * n + j];
+    }
+  }
+  return true;
+}
+
+/** Solves A x = b in place using the factors from luFactor. */
+function luSolve(A: Float64Array, n: number, piv: Int32Array, b: Float64Array) {
+  for (let k = 0; k < n; k++) {
+    const p = piv[k];
+    if (p !== k) [b[k], b[p]] = [b[p], b[k]];
+    for (let i = k + 1; i < n; i++) b[i] -= A[i * n + k] * b[k];
+  }
+  for (let i = n - 1; i >= 0; i--) {
+    let acc = b[i];
+    for (let j = i + 1; j < n; j++) acc -= A[i * n + j] * b[j];
+    b[i] = acc / A[i * n + i];
+  }
 }
 
 function initialStep(x: Float64Array, f0: Float64Array, atol: number, rtol: number, hMax: number): number {

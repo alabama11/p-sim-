@@ -37,6 +37,15 @@ export interface BlockRuntime {
   nextEvent?(t: number): number;
   /** Inputs are recorded at every major step (Scope, Display). */
   sink?: boolean;
+  /**
+   * Zero-crossing functions. Blocks keep their mode (which branch of a discontinuity
+   * they are on) fixed during minor steps; the solver finds where a function changes
+   * sign and ends the step there, so the mode switches exactly at the crossing.
+   */
+  nzc?: number;
+  zc?(t: number, u: number[], out: number[]): void;
+  /** Called after every major step with the final inputs (history of Derivative, Transport Delay). */
+  onMajor?(t: number, u: number[]): void;
 }
 
 export interface BlockDef {
@@ -46,10 +55,12 @@ export interface BlockDef {
   description: string;
   params: ParamDef[];
   ports(raw: Record<string, string>): { inputs: number; outputs: number };
+  /** Hidden from the library (internal block types). */
+  hidden?: boolean;
   create(p: Params): BlockRuntime;
 }
 
-export const CATEGORIES = ['Zdroje', 'Matematika', 'Spojité', 'Diskrétne', 'Nespojitosti', 'Smerovanie', 'Výstupy'];
+export const CATEGORIES = ['Zdroje', 'Matematika', 'Logika', 'Spojité', 'Diskrétne', 'Nespojitosti', 'Smerovanie', 'Porty a subsystémy', 'Výstupy'];
 
 function num(p: Params, name: string): number {
   const v = p[name];
@@ -259,8 +270,22 @@ const defs: BlockDef[] = [
         sin: Math.sin, cos: Math.cos, tan: Math.tan, exp: Math.exp, log: Math.log,
         sqrt: Math.sqrt, abs: Math.abs, square: (x) => x * x, sign: Math.sign,
       };
-      const f = fns[str(p, 'fn')];
-      if (!f) throw new ExprError(`Neznáma funkcia ${str(p, 'fn')}`);
+      const fn = str(p, 'fn');
+      const f = fns[fn];
+      if (!f) throw new ExprError(`Neznáma funkcia ${fn}`);
+      if (fn === 'abs' || fn === 'sign') {
+        // Discontinuous at u = 0: hold the sign during minor steps and detect the crossing.
+        let s = 1;
+        return {
+          feedthrough: true,
+          nzc: 1,
+          output(_t, _x, u, y, ctx) {
+            if (ctx.major) s = Math.sign(u[0]);
+            y[0] = fn === 'abs' ? s * u[0] : s;
+          },
+          zc(_t, u, out) { out[0] = u[0]; },
+        };
+      }
       return { feedthrough: true, output(_t, _x, u, y) { y[0] = f(u[0]); } };
     },
   },
@@ -337,6 +362,56 @@ const defs: BlockDef[] = [
     },
   },
 
+  {
+    type: 'Derivative', label: 'Derivative', category: 'Spojité',
+    description: 'Približná derivácia du/dt z posledných dvoch hlavných krokov.',
+    params: [],
+    ports: io(1, 1),
+    create() {
+      let tPrev = NaN, uPrev = 0, value = 0;
+      return {
+        feedthrough: true,
+        output(t, _x, u, y, ctx) {
+          if (ctx.major) value = t > tPrev ? (u[0] - uPrev) / (t - tPrev) : 0;
+          y[0] = value;
+        },
+        onMajor(t, u) { tPrev = t; uPrev = u[0]; },
+      };
+    },
+  },
+  {
+    type: 'TransportDelay', label: 'Transport Delay', category: 'Spojité',
+    description: 'Dopravné oneskorenie: y(t) = u(t − T).',
+    params: [
+      { name: 'delay', label: 'Oneskorenie T [s]', default: '1' },
+      { name: 'initial', label: 'Počiatočný výstup', default: '0' },
+    ],
+    ports: io(1, 1),
+    create(p) {
+      const T = num(p, 'delay'), y0 = num(p, 'initial');
+      if (!(T > 0)) throw new ExprError('Oneskorenie musí byť kladné');
+      const ts: number[] = [], us: number[] = [];
+      let start = 0; // first history index still needed
+      return {
+        feedthrough: false,
+        output(t, _x, _u, y) {
+          const td = t - T;
+          if (ts.length === 0 || td < ts[0]) { y[0] = y0; return; }
+          while (start + 1 < ts.length && ts[start + 1] <= td) start++;
+          const i = start;
+          if (i + 1 >= ts.length) { y[0] = us[i]; return; }
+          const a = (td - ts[i]) / (ts[i + 1] - ts[i]);
+          y[0] = us[i] + a * (us[i + 1] - us[i]);
+        },
+        onMajor(t, u) {
+          if (ts.length && t <= ts[ts.length - 1]) return;
+          ts.push(t);
+          us.push(u[0]);
+        },
+      };
+    },
+  },
+
   // ---------- Discrete ----------
   {
     type: 'UnitDelay', label: 'Unit Delay', category: 'Diskrétne',
@@ -394,6 +469,66 @@ const defs: BlockDef[] = [
     },
   },
 
+  {
+    type: 'DiscreteTransferFcn', label: 'Discrete Transfer Fcn', category: 'Diskrétne',
+    description: 'Diskrétna prenosová funkcia G(z) = čitateľ(z) / menovateľ(z), koeficienty od najvyššej mocniny z.',
+    params: [
+      { name: 'num', label: 'Čitateľ', default: '[1]' },
+      { name: 'den', label: 'Menovateľ', default: '[1 -0.5]' },
+      { name: 'Ts', label: 'Perióda vzorkovania [s]', default: '1' },
+    ],
+    ports: io(1, 1),
+    create(p) {
+      const den = vec(p, 'den'), numIn = vec(p, 'num');
+      if (den[0] === 0) throw new ExprError('Prvý koeficient menovateľa nesmie byť nula');
+      if (numIn.length > den.length) throw new ExprError('Stupeň čitateľa je väčší ako stupeň menovateľa');
+      const n = den.length - 1;
+      const a = den.map((c) => c / den[0]);
+      const b = [...new Array(den.length - numIn.length).fill(0), ...numIn].map((c) => c / den[0]);
+      // y(k) = b0 u(k) + b1 u(k-1) + ... - a1 y(k-1) - ...
+      const uh = new Array(n).fill(0), yh = new Array(n).fill(0);
+      let last = 0;
+      return {
+        feedthrough: b[0] !== 0,
+        sampleTime: positive(p, 'Ts'),
+        output(_t, _x, u, y) {
+          let acc = b[0] * u[0];
+          for (let i = 1; i <= n; i++) acc += b[i] * uh[i - 1] - a[i] * yh[i - 1];
+          last = acc;
+          y[0] = acc;
+        },
+        update(_t, u) {
+          uh.unshift(u[0]); uh.pop();
+          yh.unshift(last); yh.pop();
+        },
+      };
+    },
+  },
+  {
+    type: 'RandomNumber', label: 'Random Number', category: 'Zdroje',
+    description: 'Náhodné čísla s normálnym rozdelením, nová hodnota v každej vzorke.',
+    params: [
+      { name: 'mean', label: 'Stredná hodnota', default: '0' },
+      { name: 'variance', label: 'Rozptyl', default: '1' },
+      { name: 'seed', label: 'Semienko (seed)', default: '0' },
+      { name: 'Ts', label: 'Perióda vzorkovania [s]', default: '0.1' },
+    ],
+    ports: io(0, 1),
+    create(p) {
+      const mean = num(p, 'mean'), sd = Math.sqrt(Math.max(0, num(p, 'variance')));
+      const rand = mulberry32(num(p, 'seed'));
+      return {
+        feedthrough: false,
+        sampleTime: positive(p, 'Ts'),
+        output(_t, _x, _u, y) {
+          // Box-Muller
+          const u1 = Math.max(rand(), 1e-300), u2 = rand();
+          y[0] = mean + sd * Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+        },
+      };
+    },
+  },
+
   // ---------- Discontinuities ----------
   {
     type: 'Saturation', label: 'Saturation', category: 'Nespojitosti',
@@ -406,7 +541,16 @@ const defs: BlockDef[] = [
     create(p) {
       const hi = num(p, 'upper'), lo = num(p, 'lower');
       if (lo > hi) throw new ExprError('Dolná hranica je väčšia ako horná');
-      return { feedthrough: true, output(_t, _x, u, y) { y[0] = Math.min(hi, Math.max(lo, u[0])); } };
+      let mode = 0; // -1 lower limit, 0 linear, 1 upper limit
+      return {
+        feedthrough: true,
+        nzc: 2,
+        output(_t, _x, u, y, ctx) {
+          if (ctx.major) mode = u[0] >= hi ? 1 : u[0] <= lo ? -1 : 0;
+          y[0] = mode === 1 ? hi : mode === -1 ? lo : u[0];
+        },
+        zc(_t, u, out) { out[0] = u[0] - hi; out[1] = u[0] - lo; },
+      };
     },
   },
   {
@@ -432,7 +576,95 @@ const defs: BlockDef[] = [
           }
           y[0] = state ? yon : yoff;
         },
+        nzc: 1,
+        zc(_t, u, out) { out[0] = state ? u[0] - off : u[0] - on; },
       };
+    },
+  },
+
+  {
+    type: 'DeadZone', label: 'Dead Zone', category: 'Nespojitosti',
+    description: 'Nulový výstup v pásme [začiatok, koniec], mimo neho vstup posunutý o hranicu pásma.',
+    params: [
+      { name: 'start', label: 'Začiatok pásma', default: '-0.5' },
+      { name: 'end', label: 'Koniec pásma', default: '0.5' },
+    ],
+    ports: io(1, 1),
+    create(p) {
+      const a = num(p, 'start'), b = num(p, 'end');
+      if (a > b) throw new ExprError('Začiatok pásma je väčší ako koniec');
+      let mode = 0;
+      return {
+        feedthrough: true,
+        nzc: 2,
+        output(_t, _x, u, y, ctx) {
+          if (ctx.major) mode = u[0] > b ? 1 : u[0] < a ? -1 : 0;
+          y[0] = mode === 1 ? u[0] - b : mode === -1 ? u[0] - a : 0;
+        },
+        zc(_t, u, out) { out[0] = u[0] - a; out[1] = u[0] - b; },
+      };
+    },
+  },
+
+  // ---------- Logic ----------
+  {
+    type: 'RelationalOperator', label: 'Relational Operator', category: 'Logika',
+    description: 'Porovná dva vstupy; výstup je 1 (pravda) alebo 0 (nepravda).',
+    params: [{ name: 'op', label: 'Operátor', default: '<=', kind: 'choice', choices: ['==', '~=', '<', '<=', '>', '>='] }],
+    ports: io(2, 1),
+    create(p) {
+      const op = str(p, 'op');
+      const cmp: Record<string, (a: number, b: number) => boolean> = {
+        '==': (a, b) => a === b, '~=': (a, b) => a !== b, '<': (a, b) => a < b,
+        '<=': (a, b) => a <= b, '>': (a, b) => a > b, '>=': (a, b) => a >= b,
+      };
+      const f = cmp[op];
+      if (!f) throw new ExprError(`Neznámy operátor ${op}`);
+      let v = 0;
+      return {
+        feedthrough: true,
+        nzc: 1,
+        output(_t, _x, u, y, ctx) {
+          if (ctx.major) v = f(u[0], u[1]) ? 1 : 0;
+          y[0] = v;
+        },
+        zc(_t, u, out) { out[0] = u[0] - u[1]; },
+      };
+    },
+  },
+  {
+    type: 'LogicalOperator', label: 'Logical Operator', category: 'Logika',
+    description: 'Logická operácia nad vstupmi (nenulová hodnota = pravda).',
+    params: [
+      { name: 'op', label: 'Operácia', default: 'AND', kind: 'choice', choices: ['AND', 'OR', 'NAND', 'NOR', 'XOR', 'NOT'] },
+      { name: 'inputs', label: 'Počet vstupov', default: '2' },
+    ],
+    ports: (raw) => ({ inputs: raw.op === 'NOT' ? 1 : clampInt(raw.inputs, 2, 8), outputs: 1 }),
+    create(p) {
+      const op = str(p, 'op');
+      return {
+        feedthrough: true,
+        output(_t, _x, u, y) {
+          const b = u.map((v) => v !== 0);
+          const any = b.some(Boolean), all = b.every(Boolean);
+          const r = op === 'AND' ? all : op === 'OR' ? any : op === 'NAND' ? !all : op === 'NOR' ? !any
+            : op === 'XOR' ? b.filter(Boolean).length % 2 === 1 : !b[0];
+          y[0] = r ? 1 : 0;
+        },
+      };
+    },
+  },
+  {
+    type: 'MinMax', label: 'MinMax', category: 'Matematika',
+    description: 'Minimum alebo maximum zo vstupov.',
+    params: [
+      { name: 'fn', label: 'Funkcia', default: 'min', kind: 'choice', choices: ['min', 'max'] },
+      { name: 'inputs', label: 'Počet vstupov', default: '2' },
+    ],
+    ports: (raw) => ({ inputs: clampInt(raw.inputs ?? '2', 1, 8), outputs: 1 }),
+    create(p) {
+      const f = str(p, 'fn') === 'max' ? Math.max : Math.min;
+      return { feedthrough: true, output(_t, _x, u, y) { y[0] = f(...u); } };
     },
   },
 
@@ -454,8 +686,34 @@ const defs: BlockDef[] = [
           if (ctx.major) first = crit === 'u2 > prah' ? u[1] > th : crit === 'u2 ~= 0' ? u[1] !== 0 : u[1] >= th;
           y[0] = first ? u[0] : u[2];
         },
+        nzc: 1,
+        zc(_t, u, out) { out[0] = crit === 'u2 ~= 0' ? u[1] : u[1] - th; },
       };
     },
+  },
+
+  // ---------- Ports & subsystems ----------
+  // A Subsystem is flattened away before simulation; Inport/Outport become pass-through blocks.
+  {
+    type: 'Subsystem', label: 'Subsystem', category: 'Porty a subsystémy',
+    description: 'Skupina blokov ako jeden blok. Dvojklikom otvoríte jeho obsah.',
+    params: [],
+    ports: io(1, 1), // real counts come from its Inport/Outport blocks
+    create() { throw new ExprError('Subsystem sa pred simuláciou rozbalí'); },
+  },
+  {
+    type: 'Inport', label: 'In', category: 'Porty a subsystémy',
+    description: 'Vstup subsystému. Číslo portu určuje poradie vstupov.',
+    params: [{ name: 'port', label: 'Číslo portu', default: '1' }],
+    ports: io(0, 1),
+    create: passThrough,
+  },
+  {
+    type: 'Outport', label: 'Out', category: 'Porty a subsystémy',
+    description: 'Výstup subsystému. Číslo portu určuje poradie výstupov.',
+    params: [{ name: 'port', label: 'Číslo portu', default: '1' }],
+    ports: io(1, 0),
+    create: passThrough,
   },
 
   // ---------- Sinks ----------
@@ -478,6 +736,23 @@ const defs: BlockDef[] = [
     },
   },
 ];
+
+/** Inport/Outport after flattening: one input copied to one output. */
+function passThrough(): BlockRuntime {
+  return { feedthrough: true, output(_t, _x, u, y) { y[0] = u[0] ?? 0; } };
+}
+
+/** Small seeded PRNG so simulations are repeatable. */
+function mulberry32(seed: number) {
+  let a = Math.floor(seed) >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
 
 function clampInt(raw: string | undefined, lo: number, hi: number): number {
   const n = parseInt(raw ?? '', 10);

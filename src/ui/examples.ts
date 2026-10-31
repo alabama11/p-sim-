@@ -24,6 +24,7 @@ function massSpring(): Model {
   const sc = m.add('Scope', 'Scope', { inputs: '2' }, 600, 60);
   const gb = m.add('Gain', 'b', { K: 'b' }, 340, 170);
   const gk = m.add('Gain', 'k', { K: 'k' }, 460, 250);
+  m.flip(gb).flip(gk);
   m.connect(f, 0, sum, 0).connect(sum, 0, im, 0).connect(im, 0, iv, 0).connect(iv, 0, ix, 0)
     .connect(ix, 0, sc, 0).connect(iv, 0, sc, 1)
     .connect(iv, 0, gb, 0).connect(gb, 0, sum, 1)
@@ -71,10 +72,63 @@ function thermostat(): Model {
   return m.model;
 }
 
+/** The mass-spring-damper packed into a masked subsystem with parameters m, k, b. */
+function maskedOscillator(): Model {
+  const inner = new ModelBuilder('inner');
+  const f = inner.add('Inport', 'F', { port: '1' }, 20, 66);
+  const sum = inner.add('Sum', 'Súčet síl', { signs: '+--' }, 110, 51);
+  const im = inner.add('Gain', '1/m', { K: '1/m' }, 200, 60);
+  const iv = inner.add('Integrator', 'v', {}, 310, 60);
+  const ix = inner.add('Integrator', 'x', {}, 430, 60);
+  const out = inner.add('Outport', 'x', { port: '1' }, 560, 70);
+  const gb = inner.add('Gain', 'b', { K: 'b' }, 310, 170);
+  const gk = inner.add('Gain', 'k', { K: 'k' }, 430, 250);
+  inner.flip(gb).flip(gk);
+  inner.connect(f, 0, sum, 0).connect(sum, 0, im, 0).connect(im, 0, iv, 0).connect(iv, 0, ix, 0).connect(ix, 0, out, 0)
+    .connect(iv, 0, gb, 0).connect(gb, 0, sum, 1).connect(ix, 0, gk, 0).connect(gk, 0, sum, 2);
+
+  const m = new ModelBuilder('maskovany_oscilator', { stopTime: '20' });
+  const st = m.add('Step', 'Sila', { time: '1' }, 40, 80);
+  const s1 = m.add('Subsystem', 'Mäkká pružina', { m: '1', k: '1', b: '0.2' }, 180, 70);
+  const s2 = m.add('Subsystem', 'Tuhá pružina', { m: '1', k: '6', b: '0.8' }, 180, 170);
+  const sc = m.add('Scope', 'Scope', { inputs: '2' }, 380, 110);
+  for (const id of [s1, s2]) {
+    const b = m.model.blocks.find((x) => x.id === id)!;
+    b.children = structuredClone({ blocks: inner.model.blocks, links: inner.model.links });
+    b.mask = {
+      title: 'Oscilátor',
+      description: 'Teleso na pružine s tlmičom: m·x″ + b·x′ + k·x = F',
+      params: [
+        { name: 'm', label: 'Hmotnosť m [kg]', default: '1' },
+        { name: 'k', label: 'Tuhosť k [N/m]', default: '4' },
+        { name: 'b', label: 'Tlmenie b [N·s/m]', default: '0.4' },
+      ],
+    };
+  }
+  m.connect(st, 0, s1, 0).connect(st, 0, s2, 0).connect(s1, 0, sc, 0).connect(s2, 0, sc, 1);
+  return m.model;
+}
+
+function stiffSystem(): Model {
+  const m = new ModelBuilder('tuhy_system', { solver: 'ode23s', stopTime: '10' },
+    'a = 1000   % rýchlosť sledovania (veľká = tuhý systém)');
+  const clk = m.add('Clock', 'Čas', {}, 30, 60);
+  const cos = m.add('MathFunction', 'cos', { fn: 'cos' }, 120, 62);
+  const sum = m.add('Sum', 'Rozdiel', { signs: '+-' }, 230, 60);
+  const g = m.add('Gain', 'a', { K: 'a' }, 320, 60);
+  const x = m.add('Integrator', 'x', {}, 430, 60);
+  const sc = m.add('Scope', 'Scope', {}, 560, 60);
+  m.connect(clk, 0, cos, 0).connect(cos, 0, sum, 0).connect(x, 0, sum, 1).connect(sum, 0, g, 0)
+    .connect(g, 0, x, 0).connect(x, 0, sc, 0);
+  return m.model;
+}
+
 export const EXAMPLES: { title: string; make(): Model }[] = [
   { title: 'Systém 1. rádu – odozva na skok', make: firstOrder },
   { title: 'Kmitanie pružiny (hmotnosť, pružina, tlmič)', make: massSpring },
   { title: 'PID regulácia s obmedzením akčného zásahu', make: pidControl },
   { title: 'Vzorkovanie a oneskorenie (diskrétne bloky)', make: sampling },
   { title: 'Termostat (relé s hysteréziou)', make: thermostat },
+  { title: 'Maskovaný subsystém: dva oscilátory', make: maskedOscillator },
+  { title: 'Tuhý systém (riešič ode23s)', make: stiffSystem },
 ];

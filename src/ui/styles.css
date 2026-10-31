@@ -260,3 +260,28 @@ input:focus, textarea:focus, select:focus { outline: 2px solid var(--accent); ou
   .tool-group { border-left: none; padding-left: 0; }
   .scope-window { width: calc(100% - 32px); left: 16px !important; }
 }
+
+.breadcrumb {
+  position: absolute;
+  top: 10px;
+  left: 12px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px 4px 4px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 2px 8px rgb(0 0 0 / 0.08);
+  z-index: 5;
+}
+.breadcrumb button { padding: 1px 8px; margin-right: 4px; }
+.breadcrumb a { color: var(--accent); cursor: pointer; }
+.breadcrumb a:hover { text-decoration: underline; }
+.modal > footer .spacer { flex: 1; }
+.mask-table { width: 100%; border-collapse: collapse; }
+.mask-table th { text-align: left; font-weight: 500; color: var(--ink-2); padding: 0 4px 4px 0; font-size: 12px; }
+.mask-table td { padding: 2px 4px 2px 0; }
+.mask-table input { width: 100%; }
+.mask-table button { padding: 2px 8px; }
+.modal:has(.mask-table) { width: min(620px, calc(100vw - 32px)); }

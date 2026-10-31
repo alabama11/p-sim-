@@ -13,6 +13,29 @@ export interface BlockModel {
   y: number;
   /** Parameter values as typed by the user; expressions are evaluated at compile time. */
   params: Record<string, string>;
+  /** Contents of a Subsystem block. */
+  children?: Diagram;
+  /** Mask of a Subsystem: its own parameter dialog whose values become variables inside. */
+  mask?: MaskDef;
+  /** Drawn mirrored: inputs on the right, outputs on the left (handy in feedback paths). */
+  flip?: boolean;
+}
+
+export interface MaskParam {
+  name: string;
+  label: string;
+  default: string;
+}
+
+export interface MaskDef {
+  title: string;
+  description: string;
+  params: MaskParam[];
+}
+
+export interface Diagram {
+  blocks: BlockModel[];
+  links: LinkModel[];
 }
 
 export interface LinkModel {
@@ -21,7 +44,7 @@ export interface LinkModel {
   dst: PortRef;
 }
 
-export type SolverName = 'ode45' | 'ode23' | 'ode1' | 'ode2' | 'ode3' | 'ode4' | 'ode5';
+export type SolverName = 'ode45' | 'ode23' | 'ode23s' | 'ode1' | 'ode2' | 'ode3' | 'ode4' | 'ode5';
 
 export interface SimSettings {
   solver: SolverName;
@@ -35,10 +58,8 @@ export interface SimSettings {
   absTol: string;
 }
 
-export interface Model {
+export interface Model extends Diagram {
   name: string;
-  blocks: BlockModel[];
-  links: LinkModel[];
   /** Workspace statements such as `K = 2; T = 0.5`, visible to every block parameter. */
   workspace: string;
   settings: SimSettings;
