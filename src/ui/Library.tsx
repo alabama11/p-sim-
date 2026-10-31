@@ -46,7 +46,7 @@ export function Library({ onAdd }: { onAdd(type: string): void }) {
                       {d.type === 'Gain' ? (
                         <path d={`M0,0 L${w},${h / 2} L0,${h} Z`} className="block-body" />
                       ) : (
-                        <rect width={w} height={h} rx={4} className="block-body" />
+                        <rect width={w} height={h} rx={4} className={d.type === 'Mux' || d.type === 'Demux' ? 'block-body bar' : 'block-body'} />
                       )}
                       <Glyph b={b} w={w} h={h} />
                     </svg>

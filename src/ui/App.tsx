@@ -1,12 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { BLOCKS } from '../sim/blocks';
 import { runWorkspace, type Scope } from '../sim/expr';
-import { scopeAt } from '../sim/flatten';
+import { scopeAt, subsystemPorts } from '../sim/flatten';
 import { simulate, SimError, type SimResult } from '../sim/engine';
 import { SOLVER_LABELS } from '../sim/solvers';
 import { defaultSettings, emptyModel, type BlockModel, type Diagram, type Model, type SolverName } from '../sim/types';
 import { Canvas, type View } from './Canvas';
-import { MaskDialog, ParamDialog, SettingsDialog, WorkspaceDialog } from './dialogs';
+import { MaskDialog, Modal, ParamDialog, SettingsDialog, WorkspaceDialog } from './dialogs';
+import { importSimulink } from '../io/simulink';
 import { EXAMPLES } from './examples';
 import { blockSize } from './geometry';
 import { Library } from './Library';
@@ -71,6 +72,7 @@ export function App() {
   const [result, setResult] = useState<SimResult | null>(null);
   const [error, setError] = useState<{ message: string; blockId?: string } | null>(null);
   const [running, setRunning] = useState(false);
+  const [report, setReport] = useState<{ title: string; intro: string; items: string[] } | null>(null);
   const clipRef = useRef<Clip | null>(null);
   const pasteCount = useRef(0);
   const mainRef = useRef<HTMLDivElement>(null);
@@ -216,7 +218,19 @@ export function App() {
 
   const open = async (file: File) => {
     try {
-      replaceModel(parseModelFile(await file.text()));
+      if (/\.(slx|mdl)$/i.test(file.name)) {
+        const { model: m, warnings } = await importSimulink(file.name, new Uint8Array(await file.arrayBuffer()));
+        replaceModel(m);
+        if (warnings.length) {
+          setReport({
+            title: `Import: ${file.name}`,
+            intro: 'Model sa otvoril. Niektoré časti nemajú v P-Sim zodpovedajúci blok alebo nastavenie:',
+            items: warnings,
+          });
+        }
+      } else {
+        replaceModel(parseModelFile(await file.text()));
+      }
     } catch (e) {
       setError({ message: `Súbor sa nepodarilo otvoriť: ${(e as Error).message}` });
     }
@@ -269,7 +283,26 @@ export function App() {
   if (result) {
     for (const b of diagram.blocks) {
       const log = result.logs[prefix + b.id];
-      if (b.type === 'Display' && log?.t.length) displays[b.id] = String(+log.y[0][log.y[0].length - 1].toPrecision(5));
+      if (b.type === 'Display' && log?.t.length) {
+        const vals = log.y.map((ch) => +ch[ch.length - 1].toPrecision(5));
+        displays[b.id] = vals.length === 1 ? String(vals[0]) : `[${vals.length > 6 ? `${vals.slice(0, 6).join(' ')} …` : vals.join(' ')}]`;
+      }
+    }
+  }
+
+  // Vector links are drawn thicker and labelled with their width.
+  const linkWidths: Record<string, number> = {};
+  if (result) {
+    for (const l of diagram.links) {
+      const sb = diagram.blocks.find((b) => b.id === l.src.block);
+      if (!sb) continue;
+      let key = `${prefix}${sb.id}:${l.src.port}`;
+      if (sb.type === 'Subsystem') {
+        const op = subsystemPorts(sb).outports[l.src.port];
+        if (op) key = `${prefix}${sb.id}/${op.id}:0`;
+      }
+      const w = result.widths[key];
+      if (w) linkWidths[l.id] = w;
     }
   }
 
@@ -298,7 +331,7 @@ export function App() {
         />
         <div className="tool-group">
           <button onClick={() => replaceModel(emptyModel())} title="Nový prázdny model">Nový</button>
-          <button onClick={() => fileRef.current!.click()} title="Otvoriť súbor .psim">Otvoriť</button>
+          <button onClick={() => fileRef.current!.click()} title="Otvoriť model .psim alebo model Simulinku .slx / .mdl">Otvoriť</button>
           <button onClick={save} title="Uložiť model (Ctrl+S)">Uložiť</button>
           <select
             value=""
@@ -355,7 +388,7 @@ export function App() {
         <input
           ref={fileRef}
           type="file"
-          accept=".psim,.json"
+          accept=".psim,.json,.slx,.mdl"
           hidden
           onChange={(e) => {
             const f = e.target.files?.[0];
@@ -380,6 +413,7 @@ export function App() {
             onDropBlock={(t, at) => add(t, at)}
             errorBlock={errorBlock}
             displays={displays}
+            linkWidths={linkWidths}
             scope={scope}
           />
           {path.length > 0 && (
@@ -427,9 +461,26 @@ export function App() {
               ? `Hotovo: t = ${+result.tEnd.toPrecision(6)} s, ${result.steps} krokov` +
                 (result.rejected ? ` (${result.rejected} zamietnutých)` : '') +
                 `, ${result.elapsedMs.toFixed(0)} ms` +
-                (result.warnings.length ? ` · Upozornenie: ${result.warnings[0]}` + (result.warnings.length > 1 ? ` (+${result.warnings.length - 1})` : '') : '')
+                (result.warnings.length === 1 ? ` · Upozornenie: ${result.warnings[0]}` : '')
               : 'Pripravené. Dvojklik na blok otvorí jeho parametre, dvojklik na Scope zobrazí graf.'}
+        {!error && !running && result && result.warnings.length > 1 && (
+          <a
+            className="status-more"
+            onClick={() => setReport({ title: 'Upozornenia simulácie', intro: '', items: result.warnings })}
+          >
+            {` · ${result.warnings.length} upozornení (zobraziť)`}
+          </a>
+        )}
       </footer>
+
+      {report && (
+        <Modal title={report.title} onClose={() => setReport(null)} footer={<button className="primary" onClick={() => setReport(null)}>OK</button>}>
+          {report.intro && <p className="hint">{report.intro}</p>}
+          <ul className="report-list">
+            {report.items.map((w, i) => <li key={i}>{w}</li>)}
+          </ul>
+        </Modal>
+      )}
 
       {dialog?.kind === 'params' && dialogBlock && (
         <ParamDialog
@@ -509,6 +560,9 @@ function HelpDialog({ onClose }: { onClose(): void }) {
               <tr><td>Maska subsystému</td><td>Ctrl+M</td></tr>
               <tr><td>Spustiť</td><td>F5 alebo Ctrl+Enter</td></tr>
               <tr><td>Uložiť</td><td>Ctrl+S (súbor .psim)</td></tr>
+              <tr><td>Vektorové signály</td><td>Constant [1 2 3], Mux a Demux; vektorová čiara je hrubšia a ukazuje počet prvkov</td></tr>
+              <tr><td>Vlastný kód</td><td>blok Fcn (výraz z u a t) alebo Octave Function (if, for, while, viac vstupov a výstupov)</td></tr>
+              <tr><td>Otvoriť</td><td>súbory .psim aj modely Simulinku .slx a .mdl (nepodporované bloky sa nahradia zástupcom)</td></tr>
             </tbody>
           </table>
         </div>

@@ -285,3 +285,12 @@ input:focus, textarea:focus, select:focus { outline: 2px solid var(--accent); ou
 .mask-table input { width: 100%; }
 .mask-table button { padding: 2px 8px; }
 .modal:has(.mask-table) { width: min(620px, calc(100vw - 32px)); }
+.code-input { font-family: ui-monospace, 'Cascadia Code', Menlo, monospace; font-size: 12px; tab-size: 2; resize: vertical; }
+.modal:has(.code-input) { width: min(620px, calc(100vw - 32px)); }
+.block-body.bar { fill: var(--block-edge); }
+.link.vector { stroke-width: 2.6; }
+.link.vector.selected { stroke-width: 3.2; }
+.link-width { font-size: 9px; fill: var(--ink-2); pointer-events: none; font-family: ui-monospace, Menlo, monospace; }
+.glyph-code { font-size: 9px; fill: var(--ink-2); font-family: ui-monospace, Menlo, monospace; pointer-events: none; }
+.status-more { color: var(--accent); cursor: pointer; }
+.report-list { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 6px; }

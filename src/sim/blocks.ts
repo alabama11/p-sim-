@@ -1,14 +1,15 @@
 // Block library: parameters, port counts and runtime behaviour of every block type.
-// Signals are scalars in this version.
+// Signals may be vectors: most blocks are defined for one element and the engine runs
+// one copy per element; `wide` blocks (Mux, Demux, Scope, ...) see whole vectors.
 
-import { ExprError, type Value } from './expr';
+import { compileExpr, compileScript, ExprError, type Scope, type Value } from './expr';
 
 export interface ParamDef {
   name: string;
   label: string;
   default: string;
-  /** expr = evaluated expression (default), text = raw string, choice = one of `choices`. */
-  kind?: 'expr' | 'text' | 'choice';
+  /** expr = evaluated expression (default), text = raw string, code = multi-line program, choice = one of `choices`. */
+  kind?: 'expr' | 'text' | 'choice' | 'code';
   choices?: string[];
 }
 
@@ -57,10 +58,21 @@ export interface BlockDef {
   ports(raw: Record<string, string>): { inputs: number; outputs: number };
   /** Hidden from the library (internal block types). */
   hidden?: boolean;
-  create(p: Params): BlockRuntime;
+  /**
+   * Parameters given per element of a vector signal: Constant [1 2 3] outputs a
+   * width-3 vector and Gain [1 2] scales each element by its own factor.
+   */
+  slice?: string[];
+  /**
+   * The block sees all elements of all inputs at once. Given the input widths it
+   * returns the output widths, or null to work element by element after all.
+   */
+  wide?(p: Params, inW: number[], scope: Scope): number[] | null;
+  /** inW is given only to wide blocks; scope holds workspace and mask variables. */
+  create(p: Params, inW: number[] | undefined, scope: Scope): BlockRuntime;
 }
 
-export const CATEGORIES = ['Zdroje', 'Matematika', 'Logika', 'Spojité', 'Diskrétne', 'Nespojitosti', 'Smerovanie', 'Porty a subsystémy', 'Výstupy'];
+export const CATEGORIES = ['Zdroje', 'Matematika', 'Logika', 'Spojité', 'Diskrétne', 'Nespojitosti', 'Smerovanie', 'Vlastné funkcie', 'Porty a subsystémy', 'Výstupy'];
 
 function num(p: Params, name: string): number {
   const v = p[name];
@@ -109,6 +121,7 @@ const defs: BlockDef[] = [
   // ---------- Sources ----------
   {
     type: 'Constant', label: 'Constant', category: 'Zdroje',
+    slice: ['value'],
     description: 'Konštantný výstup.',
     params: [{ name: 'value', label: 'Hodnota', default: '1' }],
     ports: io(0, 1),
@@ -119,6 +132,7 @@ const defs: BlockDef[] = [
   },
   {
     type: 'Step', label: 'Step', category: 'Zdroje',
+    slice: ['time', 'before', 'after'],
     description: 'Skok z počiatočnej na koncovú hodnotu v zadanom čase.',
     params: [
       { name: 'time', label: 'Čas skoku [s]', default: '1' },
@@ -141,6 +155,7 @@ const defs: BlockDef[] = [
   },
   {
     type: 'Ramp', label: 'Ramp', category: 'Zdroje',
+    slice: ['slope', 'start', 'initial'],
     description: 'Lineárne rastúci signál od zadaného času.',
     params: [
       { name: 'slope', label: 'Sklon', default: '1' },
@@ -159,6 +174,7 @@ const defs: BlockDef[] = [
   },
   {
     type: 'SineWave', label: 'Sine Wave', category: 'Zdroje',
+    slice: ['amplitude', 'frequency', 'phase', 'bias'],
     description: 'y = A·sin(ω·t + φ) + posun',
     params: [
       { name: 'amplitude', label: 'Amplitúda A', default: '1' },
@@ -174,6 +190,7 @@ const defs: BlockDef[] = [
   },
   {
     type: 'PulseGenerator', label: 'Pulse Generator', category: 'Zdroje',
+    slice: ['amplitude', 'period', 'width', 'delay'],
     description: 'Periodické obdĺžnikové impulzy.',
     params: [
       { name: 'amplitude', label: 'Amplitúda', default: '1' },
@@ -213,6 +230,7 @@ const defs: BlockDef[] = [
   // ---------- Math ----------
   {
     type: 'Gain', label: 'Gain', category: 'Matematika',
+    slice: ['K'],
     description: 'y = K·u',
     params: [{ name: 'K', label: 'Zosilnenie K', default: '1' }],
     ports: io(1, 1),
@@ -225,10 +243,15 @@ const defs: BlockDef[] = [
     type: 'Sum', label: 'Sum', category: 'Matematika',
     description: 'Súčet vstupov so znamienkami, napr. „+-“ znamená u1 − u2.',
     params: [{ name: 'signs', label: 'Znamienka (napr. ++ alebo +-)', default: '++', kind: 'text' }],
-    ports: (raw) => ({ inputs: Math.max(1, signChars(raw.signs, '+-').length), outputs: 1 }),
-    create(p) {
+    ports: (raw) => ({ inputs: Math.max(1, signChars(raw.signs ?? '++', '+-').length), outputs: 1 }),
+    // With a single input, the elements of the input vector are summed.
+    wide: (p) => (signChars(str(p, 'signs'), '+-').length === 1 ? [1] : null),
+    create(p, inW) {
       const s = signChars(str(p, 'signs'), '+-').map((c) => (c === '-' ? -1 : 1));
       if (s.length === 0) throw new ExprError('Zadajte aspoň jedno znamienko + alebo -');
+      if (inW) {
+        return { feedthrough: true, output(_t, _x, u, y) { let acc = 0; for (const v of u) acc += v; y[0] = s[0] * acc; } };
+      }
       return {
         feedthrough: true,
         output(_t, _x, u, y) {
@@ -243,10 +266,16 @@ const defs: BlockDef[] = [
     type: 'Product', label: 'Product', category: 'Matematika',
     description: 'Súčin a podiel vstupov, napr. „*/“ znamená u1 / u2.',
     params: [{ name: 'ops', label: 'Operácie (napr. ** alebo */)', default: '**', kind: 'text' }],
-    ports: (raw) => ({ inputs: Math.max(1, signChars(raw.ops, '*/').length), outputs: 1 }),
-    create(p) {
+    ports: (raw) => ({ inputs: Math.max(1, signChars(raw.ops ?? '**', '*/').length), outputs: 1 }),
+    // With a single input, the elements of the input vector are multiplied.
+    wide: (p) => (signChars(str(p, 'ops'), '*/').length === 1 ? [1] : null),
+    create(p, inW) {
       const ops = signChars(str(p, 'ops'), '*/');
       if (ops.length === 0) throw new ExprError('Zadajte aspoň jeden znak * alebo /');
+      if (inW) {
+        const inv = ops[0] === '/';
+        return { feedthrough: true, output(_t, _x, u, y) { let acc = 1; for (const v of u) acc *= inv ? 1 / v : v; y[0] = acc; } };
+      }
       return {
         feedthrough: true,
         output(_t, _x, u, y) {
@@ -293,6 +322,7 @@ const defs: BlockDef[] = [
   // ---------- Continuous ----------
   {
     type: 'Integrator', label: 'Integrator', category: 'Spojité',
+    slice: ['x0'],
     description: 'y = ∫u dt s počiatočnou podmienkou.',
     params: [{ name: 'x0', label: 'Počiatočná podmienka', default: '0' }],
     ports: io(1, 1),
@@ -381,6 +411,7 @@ const defs: BlockDef[] = [
   },
   {
     type: 'TransportDelay', label: 'Transport Delay', category: 'Spojité',
+    slice: ['initial'],
     description: 'Dopravné oneskorenie: y(t) = u(t − T).',
     params: [
       { name: 'delay', label: 'Oneskorenie T [s]', default: '1' },
@@ -415,6 +446,7 @@ const defs: BlockDef[] = [
   // ---------- Discrete ----------
   {
     type: 'UnitDelay', label: 'Unit Delay', category: 'Diskrétne',
+    slice: ['x0'],
     description: 'Oneskorenie o jednu vzorku: y(k) = u(k−1).',
     params: [
       { name: 'x0', label: 'Počiatočná hodnota', default: '0' },
@@ -450,6 +482,7 @@ const defs: BlockDef[] = [
   },
   {
     type: 'DiscreteIntegrator', label: 'Discrete-Time Integrator', category: 'Diskrétne',
+    slice: ['K', 'x0'],
     description: 'Diskrétny integrátor (dopredná Eulerova metóda): y(k) = y(k−1) + K·Ts·u(k−1).',
     params: [
       { name: 'K', label: 'Zosilnenie K', default: '1' },
@@ -506,6 +539,7 @@ const defs: BlockDef[] = [
   },
   {
     type: 'RandomNumber', label: 'Random Number', category: 'Zdroje',
+    slice: ['mean', 'variance', 'seed'],
     description: 'Náhodné čísla s normálnym rozdelením, nová hodnota v každej vzorke.',
     params: [
       { name: 'mean', label: 'Stredná hodnota', default: '0' },
@@ -532,6 +566,7 @@ const defs: BlockDef[] = [
   // ---------- Discontinuities ----------
   {
     type: 'Saturation', label: 'Saturation', category: 'Nespojitosti',
+    slice: ['upper', 'lower'],
     description: 'Obmedzí signál na interval [dolná, horná].',
     params: [
       { name: 'upper', label: 'Horná hranica', default: '0.5' },
@@ -555,6 +590,7 @@ const defs: BlockDef[] = [
   },
   {
     type: 'Relay', label: 'Relay', category: 'Nespojitosti',
+    slice: ['on', 'off', 'yon', 'yoff'],
     description: 'Dvojpolohový prepínač s hysteréziou.',
     params: [
       { name: 'on', label: 'Bod zapnutia', default: '0.1' },
@@ -584,6 +620,7 @@ const defs: BlockDef[] = [
 
   {
     type: 'DeadZone', label: 'Dead Zone', category: 'Nespojitosti',
+    slice: ['start', 'end'],
     description: 'Nulový výstup v pásme [začiatok, koniec], mimo neho vstup posunutý o hranicu pásma.',
     params: [
       { name: 'start', label: 'Začiatok pásma', default: '-0.5' },
@@ -662,6 +699,8 @@ const defs: BlockDef[] = [
       { name: 'inputs', label: 'Počet vstupov', default: '2' },
     ],
     ports: (raw) => ({ inputs: clampInt(raw.inputs ?? '2', 1, 8), outputs: 1 }),
+    // With a single input: minimum or maximum over the elements of the vector.
+    wide: (p) => (vec(p, 'inputs')[0] === 1 ? [1] : null),
     create(p) {
       const f = str(p, 'fn') === 'max' ? Math.max : Math.min;
       return { feedthrough: true, output(_t, _x, u, y) { y[0] = f(...u); } };
@@ -671,6 +710,7 @@ const defs: BlockDef[] = [
   // ---------- Routing ----------
   {
     type: 'Switch', label: 'Switch', category: 'Smerovanie',
+    slice: ['threshold'],
     description: 'Prepúšťa vstup 1, ak riadiaci vstup 2 splní podmienku, inak vstup 3.',
     params: [
       { name: 'criterion', label: 'Podmienka', default: 'u2 >= prah', kind: 'choice', choices: ['u2 >= prah', 'u2 > prah', 'u2 ~= 0'] },
@@ -688,6 +728,83 @@ const defs: BlockDef[] = [
         },
         nzc: 1,
         zc(_t, u, out) { out[0] = crit === 'u2 ~= 0' ? u[1] : u[1] - th; },
+      };
+    },
+  },
+
+  {
+    type: 'Mux', label: 'Mux', category: 'Smerovanie',
+    description: 'Spojí vstupné signály do jedného vektora.',
+    params: [{ name: 'inputs', label: 'Počet vstupov', default: '2' }],
+    ports: (raw) => ({ inputs: clampInt(raw.inputs ?? '2', 1, 16), outputs: 1 }),
+    wide: (_p, inW) => [inW.reduce((a, b) => a + b, 0)],
+    create() {
+      return { feedthrough: true, output(_t, _x, u, y) { for (let i = 0; i < u.length; i++) y[i] = u[i]; } };
+    },
+  },
+  {
+    type: 'Demux', label: 'Demux', category: 'Smerovanie',
+    description: 'Rozdelí vektor na niekoľko signálov (prvky sa rozdelia rovnomerne).',
+    params: [{ name: 'outputs', label: 'Počet výstupov', default: '2' }],
+    ports: (raw) => ({ inputs: 1, outputs: clampInt(raw.outputs ?? '2', 1, 16) }),
+    wide(p, inW) {
+      const n = clampInt(String(vec(p, 'outputs')[0]), 1, 16), w = inW[0];
+      if (w < n) throw new ExprError(`Vstup má len ${w} prvkov, výstupov je ${n}`);
+      return Array.from({ length: n }, (_, i) => Math.floor(w / n) + (i < w % n ? 1 : 0));
+    },
+    create() {
+      return { feedthrough: true, output(_t, _x, u, y) { for (let i = 0; i < u.length; i++) y[i] = u[i]; } };
+    },
+  },
+
+  // ---------- User-defined functions ----------
+  {
+    type: 'Fcn', label: 'Fcn', category: 'Vlastné funkcie',
+    description: 'Výraz v syntaxi Octave zo vstupu u (vektor: u(1), u(2), …) a času t, napr. „u(1)^2 + sin(t)“.',
+    params: [{ name: 'expr', label: 'Výraz', default: 'u^2', kind: 'text' }],
+    ports: io(1, 1),
+    wide: (p, inW, scope) => [probeWidth(() => compileExpr(str(p, 'expr'))({ ...scope, u: zeros(inW[0]), t: [0] }))],
+    create(p, _inW, scope) {
+      const f = compileExpr(str(p, 'expr'));
+      const sc: Scope = { ...scope };
+      return {
+        feedthrough: true,
+        output(t, _x, u, y) {
+          sc.u = u;
+          sc.t = [t];
+          const v = f(sc);
+          for (let i = 0; i < y.length; i++) y[i] = v.length === 1 ? v[0] : v[i] ?? 0;
+        },
+      };
+    },
+  },
+  {
+    type: 'OctaveFcn', label: 'Octave Function', category: 'Vlastné funkcie',
+    description:
+      'Krátky program v syntaxi Octave/MATLAB. Vstupy sú u1, u2, … (pri jednom vstupe aj u), výstupy y1, y2, … ' +
+      '(pri jednom výstupe aj y), čas t. Podporuje if/elseif/else, for, while a premenné z pracovného priestoru.',
+    params: [
+      { name: 'code', label: 'Kód', default: 'if u > 0\n  y = u;\nelse\n  y = 0;\nend', kind: 'code' },
+      { name: 'inputs', label: 'Počet vstupov', default: '1' },
+      { name: 'outputs', label: 'Počet výstupov', default: '1' },
+    ],
+    ports: (raw) => ({ inputs: clampInt(raw.inputs ?? '1', 0, 8), outputs: clampInt(raw.outputs ?? '1', 1, 8) }),
+    wide(p, inW, scope) {
+      const run = octaveFcn(p, scope);
+      return probe(() => run(0, inW.map(zeros)), clampInt(String(vec(p, 'outputs')[0]), 1, 8));
+    },
+    create(p, inW, scope) {
+      const run = octaveFcn(p, scope);
+      return {
+        feedthrough: true,
+        output(t, _x, u, y) {
+          // Inputs arrive flattened; split them back into u1, u2, ...
+          let o = 0;
+          const ins = inW!.map((w) => u.slice(o, (o += w)));
+          const outs = run(t, ins);
+          let k = 0;
+          for (const v of outs) for (const x of v) y[k++] = x;
+        },
       };
     },
   },
@@ -722,6 +839,7 @@ const defs: BlockDef[] = [
     description: 'Zobrazí priebehy vstupných signálov v čase.',
     params: [{ name: 'inputs', label: 'Počet vstupov', default: '1' }],
     ports: (raw) => ({ inputs: clampInt(raw.inputs, 1, 8), outputs: 0 }),
+    wide: () => [],
     create() {
       return { feedthrough: true, sink: true, output() {} };
     },
@@ -731,11 +849,71 @@ const defs: BlockDef[] = [
     description: 'Ukáže poslednú hodnotu vstupu priamo v bloku.',
     params: [],
     ports: io(1, 0),
+    wide: () => [],
     create() {
       return { feedthrough: true, sink: true, output() {} };
     },
   },
+  {
+    type: 'Terminator', label: 'Terminator', category: 'Výstupy',
+    description: 'Ukončí nepoužitý signál (bez upozornenia na nepripojený výstup).',
+    params: [],
+    ports: io(1, 0),
+    wide: () => [],
+    create() {
+      return { feedthrough: false, output() {} };
+    },
+  },
+  {
+    type: 'Unsupported', label: 'Nepodporovaný blok', category: 'Výstupy', hidden: true,
+    description: 'Zástupca bloku z importovaného modelu, ktorý P-Sim zatiaľ nepozná. Jeho výstupy sú nulové.',
+    params: [
+      { name: 'kind', label: 'Pôvodný typ', default: '?', kind: 'text' },
+      { name: 'inputs', label: 'Počet vstupov', default: '1', kind: 'text' },
+      { name: 'outputs', label: 'Počet výstupov', default: '1', kind: 'text' },
+    ],
+    ports: (raw) => ({ inputs: clampInt(raw.inputs ?? '1', 0, 32), outputs: clampInt(raw.outputs ?? '1', 0, 32) }),
+    create() {
+      return { feedthrough: false, output(_t, _x, _u, y) { y.fill(0); } };
+    },
+  },
 ];
+
+const zeros = (n: number) => new Array(n).fill(0);
+
+/** Output width of a user expression, found by evaluating it once on zero inputs. */
+function probeWidth(f: () => Value): number {
+  try {
+    return Math.max(1, f().length);
+  } catch {
+    return 1; // the real error is reported when the simulation runs
+  }
+}
+
+function probe(f: () => Value[], n: number): number[] {
+  try {
+    return f().map((v) => Math.max(1, v.length));
+  } catch {
+    return new Array(n).fill(1);
+  }
+}
+
+/** Compiles an Octave Function block: returns (t, inputs) => outputs. */
+function octaveFcn(p: Params, scope: Scope) {
+  const script = compileScript(str(p, 'code'));
+  const nIn = clampInt(String(vec(p, 'inputs')[0]), 0, 8), nOut = clampInt(String(vec(p, 'outputs')[0]), 1, 8);
+  return (t: number, ins: number[][]): Value[] => {
+    const sc: Scope = { ...scope, t: [t] };
+    ins.forEach((v, i) => (sc[`u${i + 1}`] = v));
+    if (nIn === 1) sc.u = ins[0];
+    script(sc);
+    return Array.from({ length: nOut }, (_, i) => {
+      const v = sc[`y${i + 1}`] ?? (nOut === 1 ? sc.y : undefined);
+      if (!v) throw new ExprError(`Kód nepriradil výstup ${nOut === 1 ? 'y' : `y${i + 1}`}`);
+      return v;
+    });
+  };
+}
 
 /** Inport/Outport after flattening: one input copied to one output. */
 function passThrough(): BlockRuntime {

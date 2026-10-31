@@ -35,6 +35,8 @@ interface Props {
   onDropBlock(type: string, at: Pt): void;
   errorBlock?: string;
   displays: Record<string, string>;
+  /** Width of the signal on each link of this diagram after the last simulation (by link id). */
+  linkWidths?: Record<string, number>;
   /** Workspace variables, so icons can show evaluated parameters. */
   scope: Scope;
 }
@@ -258,10 +260,16 @@ export function Canvas(p: Props) {
           if (!route) return null;
           const d = pointsToPath(route);
           const sel = p.selection.has(l.id);
+          const width = p.linkWidths?.[l.id] ?? 1;
+          const cls = ['link', sel && 'selected', width > 1 && 'vector'].filter(Boolean).join(' ');
+          const a = route[0], dir = route[1] && route[1].x < a.x ? -1 : 1;
           return (
             <g key={l.id} onPointerDown={(e) => onLinkDown(e, l.id)} className="link-group">
               <path d={d} className="link-hit" />
-              <path d={d} className={sel ? 'link selected' : 'link'} markerEnd={sel ? 'url(#arrow-sel)' : 'url(#arrow)'} />
+              <path d={d} className={cls} markerEnd={sel ? 'url(#arrow-sel)' : 'url(#arrow)'} />
+              {width > 1 && (
+                <text x={a.x + 6 * dir} y={a.y - 5} textAnchor={dir > 0 ? 'start' : 'end'} className="link-width">{width}</text>
+              )}
             </g>
           );
         })}
@@ -280,7 +288,7 @@ export function Canvas(p: Props) {
                 {b.type === 'Gain' ? (
                   <path d={b.flip ? `M${w},0 L0,${h / 2} L${w},${h} Z` : `M0,0 L${w},${h / 2} L0,${h} Z`} className="block-body" />
                 ) : (
-                  <rect width={w} height={h} rx={4} className="block-body" />
+                  <rect width={w} height={h} rx={b.type === 'Mux' || b.type === 'Demux' ? 1 : 4} className={b.type === 'Mux' || b.type === 'Demux' ? 'block-body bar' : 'block-body'} />
                 )}
                 <Glyph b={b} w={w} h={h} display={p.displays[b.id]} scope={p.scope} />
               </g>

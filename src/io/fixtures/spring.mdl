@@ -1,0 +1,170 @@
+# Hand-written model in the classic text format, used by the import tests.
+Model {
+  Name			  "spring"
+  Version		  7.4
+  PreLoadFcn		  "m = 1; k = 4;"
+  Array {
+    Type		    "Handle"
+    Dimension		    1
+    Simulink.ConfigSet {
+      Array {
+	Simulink.SolverCC {
+	  StartTime		  "0.0"
+	  StopTime		  "pi"
+	  Solver		  "ode45"
+	  RelTol		  "1e-6"
+	  AbsTol		  "auto"
+	}
+      }
+    }
+  }
+  BlockParameterDefaults {
+    Block {
+      BlockType		      Gain
+      Gain		      "1"
+      Multiplication	      "Element-wise(K.*u)"
+    }
+    Block {
+      BlockType		      Integrator
+      InitialCondition	      "0"
+    }
+  }
+  System {
+    Name		    "spring"
+    Block {
+      BlockType		      Integrator
+      Name		      "v"
+      SID		      "1"
+      Position		      [150, 85, 180, 115]
+    }
+    Block {
+      BlockType		      Integrator
+      Name		      "x"
+      SID		      "2"
+      Position		      [230, 85, 260, 115]
+      InitialCondition	      "1"
+    }
+    Block {
+      BlockType		      Gain
+      Name		      "-k/m"
+      SID		      "3"
+      Position		      [190, 150, 220, 180]
+      BlockMirror	      on
+      Gain		      "-k"
+	"/m"
+    }
+    Block {
+      BlockType		      Scope
+      Name		      "Scope"
+      SID		      "4"
+      Position		      [320, 84, 350, 116]
+      NumInputPorts	      "1"
+    }
+    Block {
+      BlockType		      SubSystem
+      Name		      "Scaled"
+      SID		      "5"
+      Position		      [320, 150, 380, 190]
+      MaskVariables	      "g=@1;"
+      MaskPromptString	      "Gain"
+      MaskValueString	      "3"
+      System {
+	Name			"Scaled"
+	Block {
+	  BlockType		  Inport
+	  Name			  "In1"
+	  SID			  "6"
+	  Position		  [20, 20, 50, 34]
+	}
+	Block {
+	  BlockType		  Gain
+	  Name			  "G"
+	  SID			  "7"
+	  Position		  [80, 15, 110, 45]
+	  Gain			  "g"
+	}
+	Block {
+	  BlockType		  Outport
+	  Name			  "Out1"
+	  SID			  "8"
+	  Position		  [140, 20, 170, 34]
+	}
+	Line {
+	  SrcBlock		  "In1"
+	  SrcPort		  1
+	  DstBlock		  "G"
+	  DstPort		  1
+	}
+	Line {
+	  SrcBlock		  "G"
+	  SrcPort		  1
+	  DstBlock		  "Out1"
+	  DstPort		  1
+	}
+      }
+    }
+    Block {
+      BlockType		      Display
+      Name		      "Display"
+      SID		      "9"
+      Position		      [420, 155, 480, 185]
+    }
+    Block {
+      BlockType		      "M-S-Function"
+      Name		      "Legacy"
+      SID		      "10"
+      Ports		      [0, 1]
+      Position		      [20, 20, 60, 50]
+    }
+    Block {
+      BlockType		      Terminator
+      Name		      "T"
+      SID		      "11"
+      Position		      [100, 20, 120, 40]
+    }
+    Line {
+      SrcBlock		      "v"
+      SrcPort		      1
+      DstBlock		      "x"
+      DstPort		      1
+    }
+    Line {
+      SrcBlock		      "x"
+      SrcPort		      1
+      Points		      [20, 0]
+      Branch {
+	DstBlock		"Scope"
+	DstPort			1
+      }
+      Branch {
+	Points			[0, 65]
+	Branch {
+	  DstBlock		  "-k/m"
+	  DstPort		  1
+	}
+	Branch {
+	  DstBlock		  "Scaled"
+	  DstPort		  1
+	}
+      }
+    }
+    Line {
+      SrcBlock		      "-k/m"
+      SrcPort		      1
+      DstBlock		      "v"
+      DstPort		      1
+    }
+    Line {
+      SrcBlock		      "Scaled"
+      SrcPort		      1
+      DstBlock		      "Display"
+      DstPort		      1
+    }
+    Line {
+      SrcBlock		      "Legacy"
+      SrcPort		      1
+      DstBlock		      "T"
+      DstPort		      1
+    }
+  }
+}

@@ -54,7 +54,7 @@ export function ParamDialog({ block, scope, scopeError, onApply, onClose, onOpen
       const params: Params = {};
       for (const pd of paramDefs) {
         const raw = values[pd.name];
-        if (pd.kind === 'text' || pd.kind === 'choice') params[pd.name] = raw;
+        if (pd.kind === 'text' || pd.kind === 'choice' || pd.kind === 'code') params[pd.name] = raw;
         else {
           try {
             params[pd.name] = evaluate(raw, scope);
@@ -63,7 +63,7 @@ export function ParamDialog({ block, scope, scopeError, onApply, onClose, onOpen
           }
         }
       }
-      if (!masked) def.create(params);
+      if (!masked) def.create(params, def.wide ? new Array(def.ports(values).inputs).fill(1) : undefined, scope);
     } catch (e) {
       return setError((e as Error).message);
     }
@@ -95,6 +95,14 @@ export function ParamDialog({ block, scope, scopeError, onApply, onClose, onOpen
               <select value={values[pd.name]} onChange={(e) => setValues({ ...values, [pd.name]: e.target.value })}>
                 {pd.choices!.map((c) => <option key={c} value={c}>{c}</option>)}
               </select>
+            ) : pd.kind === 'code' ? (
+              <textarea
+                className="code-input"
+                rows={Math.min(16, Math.max(6, values[pd.name].split('\n').length + 1))}
+                value={values[pd.name]}
+                spellCheck={false}
+                onChange={(e) => setValues({ ...values, [pd.name]: e.target.value })}
+              />
             ) : (
               <input
                 value={values[pd.name]}

@@ -123,6 +123,48 @@ function stiffSystem(): Model {
   return m.model;
 }
 
+function vectorOscillators(): Model {
+  const m = new ModelBuilder('vektorove_oscilatory', { stopTime: '10', relTol: '1e-6' },
+    'k = [1 4 9]   % tri tuhosti naraz: jeden vektorový signál so 3 prvkami');
+  const iv = m.add('Integrator', 'Rýchlosti v', { x0: '0' }, 160, 60);
+  const ix = m.add('Integrator', 'Polohy x', { x0: '[1 1 1]' }, 290, 60);
+  const sc = m.add('Scope', 'Polohy', {}, 470, 60);
+  const gk = m.add('Gain', '-k', { K: '-k' }, 225, 160);
+  const mux = m.add('Mux', 'Mux', { inputs: '2' }, 400, 230);
+  const en = m.add('Fcn', 'Energia', { expr: '0.5*sum(k.*u(1:3).^2 + u(4:6).^2)' }, 450, 236);
+  const se = m.add('Scope', 'Celková energia', {}, 600, 230);
+  m.flip(gk);
+  m.connect(iv, 0, ix, 0).connect(ix, 0, sc, 0).connect(ix, 0, gk, 0).connect(gk, 0, iv, 0)
+    .connect(ix, 0, mux, 0).connect(iv, 0, mux, 1).connect(mux, 0, en, 0).connect(en, 0, se, 0);
+  return m.model;
+}
+
+function tankLevel(): Model {
+  const m = new ModelBuilder('hladina_v_nadrzi', { stopTime: '40' },
+    'A = 1      % prierez nádrže [m²]\na = 0.5    % výtokový koeficient\nqmax = 2   % najväčší prítok [m³/s]');
+  const ref = m.add('Step', 'Žiadaná hladina', { time: '15', before: '1', after: '2' }, 30, 60);
+  const code = [
+    '% Regulátor prítoku: naplno, zavrieť, alebo úmerne odchýlke',
+    'e = u1 - u2;   % žiadaná mínus skutočná hladina',
+    'if e > 0.2',
+    '  y = qmax;',
+    'elseif e < -0.2',
+    '  y = 0;',
+    'else',
+    '  y = qmax/2 + 2.5*qmax*e;',
+    'end',
+  ].join('\n');
+  const ctl = m.add('OctaveFcn', 'Regulátor', { code, inputs: '2', outputs: '1' }, 170, 70);
+  const mux = m.add('Mux', 'Mux', { inputs: '2' }, 330, 66);
+  const tank = m.add('Fcn', 'Nádrž dh/dt', { expr: '(u(1) - a*sqrt(max(u(2), 0)))/A' }, 380, 76);
+  const h = m.add('Integrator', 'Hladina h', { x0: '0.2' }, 530, 73);
+  const sc = m.add('Scope', 'Scope', { inputs: '3' }, 660, 70);
+  m.connect(ref, 0, ctl, 0).connect(h, 0, ctl, 1).connect(ctl, 0, mux, 0).connect(h, 0, mux, 1)
+    .connect(mux, 0, tank, 0).connect(tank, 0, h, 0)
+    .connect(h, 0, sc, 0).connect(ref, 0, sc, 1).connect(ctl, 0, sc, 2);
+  return m.model;
+}
+
 export const EXAMPLES: { title: string; make(): Model }[] = [
   { title: 'Systém 1. rádu – odozva na skok', make: firstOrder },
   { title: 'Kmitanie pružiny (hmotnosť, pružina, tlmič)', make: massSpring },
@@ -131,4 +173,6 @@ export const EXAMPLES: { title: string; make(): Model }[] = [
   { title: 'Termostat (relé s hysteréziou)', make: thermostat },
   { title: 'Maskovaný subsystém: dva oscilátory', make: maskedOscillator },
   { title: 'Tuhý systém (riešič ode23s)', make: stiffSystem },
+  { title: 'Vektorové signály: tri oscilátory naraz', make: vectorOscillators },
+  { title: 'Octave Function: regulácia hladiny v nádrži', make: tankLevel },
 ];
